@@ -1,24 +1,67 @@
 extern crate crossbeam;
 
-use std::ptr;
-use std::cmp;
-use std::fmt;
 use std::marker::PhantomData;
-use std::mem;
+use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::option::Option;
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use crossbeam::epoch::{Guard, CompareAndSetOrdering};
 use crossbeam::atomic::AtomicConsume;
-use std::num::NonZeroUsize;
-use std::ptr::NonNull;
 
-// v3: track ownership, use AtomicUsize
 
-/// Models a non-null `*const T`
+/// Directly manipulate the reference count of an `Arc<T>`
+/// 
+/// # Safety
+/// 
+/// The pointer must have originated from `Arc::into_raw`.  The reference count
+/// must be at least one.  Memory must have been appropriately synchronized.
+/// 
+/// # Examples
+/// 
+/// ```
+/// use std::sync::Arc;
+/// 
+/// unsafe {
+///     let p = Arc::into_raw(Arc::new(1234));
+///     carc::incr_strong_count(p);
+///     let a = Arc::from_raw(p); // This is getting out of hand!  Now there
+///     let b = Arc::from_raw(p); // are two of them!
+/// }
+/// ```
+pub unsafe fn incr_strong_count<T>(ptr: *const T) -> *const T {
+    let x = Arc::from_raw(ptr); 
+    std::mem::forget(x.clone()); // <-- increments strong count
+    std::mem::forget(x);
+    ptr
+}
+
+/// Directly manipulate the reference count of an `Arc<T>`
+///
+/// # Safety
+/// 
+/// The pointer must have originated from `Arc::into_raw`.  The reference count
+/// must be at least one.  Memory must have been appropriately synchronized.
+/// 
+/// # Examples
+/// 
+/// ```
+/// use std::sync::Arc;
+/// 
+/// unsafe {
+///     let p = Arc::into_raw(Arc::new(1234));
+///     carc::decr_strong_count(p); // Destroys the arc; *p now invalid
+/// }
+/// ```
+pub unsafe fn decr_strong_count<T>(ptr: *const T) -> *const T{
+    std::mem::drop(Arc::from_raw(ptr)); // <-- decrements strong count
+    ptr
+}
+
+
+/// Model a non-null `*const T`
 #[derive(Copy, Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct NonNullConst<T: ?Sized> {
-    data: NonNull<T>,
+    data: std::ptr::NonNull<T>,
 }
 
 impl<T: ?Sized> NonNullConst<T> {
@@ -28,24 +71,27 @@ impl<T: ?Sized> NonNullConst<T> {
     /// # Safety
     /// 
     /// `ptr` must be non-null.
-    unsafe fn new_unchecked(ptr: *const T) -> Self {
-        Self { data: NonNull::new_unchecked(ptr as *mut T), }
+    /// 
+    /// # Examples
+    /// 
+    pub unsafe fn new_unchecked(ptr: *const T) -> Self {
+        Self { data: std::ptr::NonNull::new_unchecked(ptr as *mut T), }
     }
 
     /// Creates a `NonNullConst` if `ptr` is non-null.
-    fn new(ptr: *const T) -> Option<Self> {
-        NonNull::new(ptr as *mut T).map(|x| { Self { data: x } } )
+    pub fn new(ptr: *const T) -> Option<Self> {
+        std::ptr::NonNull::new(ptr as *mut T).map(|x| { Self { data: x } } )
     }
 
 
     /// Returns the underlying non-null pointer
-    fn as_ptr(self) -> *const T {
-        NonNull::as_ptr(self.data)
+    pub fn as_ptr(self) -> *const T {
+        std::ptr::NonNull::as_ptr(self.data)
     }
 
     /// Dereferences the content
-    unsafe fn as_ref(&self) -> &T {
-        NonNull::as_ref(&self.data)
+    pub unsafe fn as_ref(&self) -> &T {
+        std::ptr::NonNull::as_ref(&self.data)
     }
 
 }
@@ -59,30 +105,43 @@ impl<T: ?Sized> NonNullConst<T> {
 // OptionArcIn
 // OptionArcOut
 
-pub trait IntoUsize<'g, T> {
+/// Can be converted into a pointer (or usize) ultimately from from `Arc::into_raw` or `Arc::as_ptr` or `ptr::null`
+pub trait OptionArcLike<T> {
+
     fn as_usize(&self) -> usize;
     fn into_usize(self) -> usize;
+
+    fn as_ptr(&self) -> *const T { 
+        self.as_usize() as *const T
+    }
+    
 }
 
-pub trait IntoNonZeroUsize<'g, T> : IntoUsize<'g, T> {
+/// Can be converted into a non-null pointer (or non-zero usize) ultimately from `Arc::into_raw` or `Arc::as_ptr`
+pub trait ArcLike<T> : OptionArcLike<T> {
+
     fn as_non_zero_usize(&self) -> NonZeroUsize;
     fn into_non_zero_usize(self) -> NonZeroUsize;
+
+    fn as_non_null_const(&self) -> NonNullConst<T> {
+        // Safety: pointer comes from a nonzero usize
+        unsafe { NonNullConst::new_unchecked(self.as_non_zero_usize().get() as *const T) }
+    }
+
 }
 
+/// Can be constructed from a non-null pointer (or non-zero usize) ultimately from `Arc::into_raw` or `Arc::as_ptr`
 pub trait FromNonZeroUsize<'g, T> {
     unsafe fn from_non_zero_usize(data: NonZeroUsize, guard: &'g Guard) -> Self;
 }
 
+/// Can be constructed from a pointer (or usize) ultimately from `Arc::into_raw` or `Arc::as_ptr` or `ptr::null`
 pub trait FromUsize<'g, T> : FromNonZeroUsize<'g, T> {
     unsafe fn from_usize(data: usize, guard: &'g Guard) -> Self;   
 }
 
 
-// into_owned_non_zero_usize implies into_owned_usize
-// from_owned_usize implies from_owned_non_zero_usize
-
-
-impl<'g, T> IntoUsize<'g, T> for *const T {   
+impl<T> OptionArcLike<T> for *const T {   
 
     fn as_usize(&self) -> usize {
         *self as usize
@@ -112,7 +171,7 @@ impl<'g, T> FromUsize<'g, T> for *const T {
 
 
 
-impl<'g, T> IntoNonZeroUsize<'g, T> for Arc<T> {
+impl<T> ArcLike<T> for Arc<T> {
     
     fn as_non_zero_usize(&self) -> NonZeroUsize {
         unsafe { NonZeroUsize::new_unchecked(Arc::as_ptr(self) as usize) }
@@ -124,7 +183,7 @@ impl<'g, T> IntoNonZeroUsize<'g, T> for Arc<T> {
 
 }
 
-impl<'g, T> IntoUsize<'g, T> for Arc<T> {
+impl<T> OptionArcLike<T> for Arc<T> {
 
     fn as_usize(&self) -> usize {
         Arc::as_ptr(self) as usize
@@ -145,7 +204,7 @@ impl<'g, T> FromNonZeroUsize<'g, T> for Arc<T> {
 }
 
 
-impl<'g, T> IntoUsize<'g, T> for Option<Arc<T>> {
+impl<T> OptionArcLike<T> for Option<Arc<T>> {
 
     fn as_usize(&self) -> usize {
         self.as_ref().map_or(0, |x| { Arc::as_ptr(x) as usize }) 
@@ -192,14 +251,14 @@ pub struct ProtectedArc<'g, T: 'g> {
 
 impl<'g, T: 'g> ProtectedArc<'g, T> {
 
-    pub fn as_ptr(&self) -> *const T {
-        self.data.get() as *const T
-    }
-
     pub unsafe fn as_arc(&self) -> Arc<T> {
         let a = Arc::from_raw(self.data.get() as *const T);
-        mem::forget(a.clone());
+        std::mem::forget(a.clone());
         a
+    }
+
+    pub fn as_ptr(&self) -> *const T {
+        self.data.get() as *const T
     }
 
     pub unsafe fn into_arc(self) -> Arc<T> {
@@ -233,7 +292,7 @@ impl<'g, T> Deref for ProtectedArc<'g, T> {
 
 }
 
-impl<'g, T> IntoNonZeroUsize<'g, T> for ProtectedArc<'g, T> {
+impl<'g, T> ArcLike<T> for ProtectedArc<'g, T> {
     
     fn as_non_zero_usize(&self) -> NonZeroUsize {
         self.data
@@ -245,7 +304,7 @@ impl<'g, T> IntoNonZeroUsize<'g, T> for ProtectedArc<'g, T> {
 
 }
 
-impl<'g, T> IntoUsize<'g, T> for ProtectedArc<'g, T> {
+impl<'g, T> OptionArcLike<T> for ProtectedArc<'g, T> {
 
     fn as_usize(&self) -> usize {
         self.data.get()
@@ -268,7 +327,7 @@ impl<'g, T> FromNonZeroUsize<'g, T> for ProtectedArc<'g, T> {
     
 }
 
-impl<'g, T> IntoUsize<'g, T> for Option<ProtectedArc<'g, T>> {
+impl<'g, T> OptionArcLike<T> for Option<ProtectedArc<'g, T>> {
 
     fn as_usize(&self) -> usize {
         self.map_or(0, |x| { x.data.get() as usize })
@@ -312,42 +371,54 @@ pub struct OwnedArc<'g, T> {
 
 impl<'g, T> OwnedArc<'g, T> {
 
-    pub fn new(value: T, guard: &'g Guard) -> Self {
-        unsafe { Self::from_non_zero_usize(Arc::new(value).into_non_zero_usize(), guard) }
+    pub unsafe fn as_arc(&self) -> Arc<T> {
+        let x : Arc<T> = Arc::from_non_zero_usize(self.data, self.guard);
+        std::mem::forget(x.clone());
+        x
     }
 
-    pub fn as_shared(&self) -> ProtectedArc<'g, T> {
+    pub fn as_protected_arc(&self) -> ProtectedArc<'g, T> {
         ProtectedArc {
             data: self.data,
             _marker: PhantomData,
         }
     }
 
-    pub fn as_arc(&self) -> Arc<T> {
-        let x : Arc<T> = unsafe { Arc::from_non_zero_usize(self.data, self.guard) };
-        mem::forget(x.clone());
-        x
+    pub fn as_ptr(&self) -> *const T{
+        self.data.get() as *const T        
     }
 
-    pub fn upgrade(&self) -> Arc<T> {
-        self.as_arc()
+    pub fn new(value: T, guard: &'g Guard) -> Self {
+        unsafe { Self::from_non_zero_usize(Arc::new(value).into_non_zero_usize(), guard) }
     }
 
-    pub fn into_arc(self) -> Arc<T> {
+    pub unsafe fn into_arc(self) -> Arc<T> {
         self.as_arc() // increments
         // implicit drop decrements after epoch
     }
 
-    pub fn into_shared(self) -> ProtectedArc<'g, T> {
-        self.as_shared()
+    pub fn into_protected_arc(self) -> ProtectedArc<'g, T> {
+        self.as_protected_arc()
         // implicit drop decrements after epoch
     }
 
 }
 
+impl<'g, T> AsRef<T> for OwnedArc<'g, T> {
+    fn as_ref(&self) -> &T {
+        unsafe { &*self.as_ptr() }
+    }
+}
+
+impl<'g, T> std::borrow::Borrow<T> for OwnedArc<'g, T> {
+    fn borrow(&self) -> &T {
+        unsafe { &*self.as_ptr() }
+    }
+}
+
 impl<'g, T> Clone for OwnedArc<'g, T> {
     fn clone(&self) -> Self {
-        mem::forget(self.as_arc());
+        unsafe { std::mem::forget(self.as_arc()) };
         Self {
             data: self.data,
             guard: self.guard,
@@ -369,20 +440,35 @@ impl<'g, T> Drop for OwnedArc<'g, T> {
     }
 }
 
-impl<'g, T> IntoNonZeroUsize<'g, T> for OwnedArc<'g, T> {
+impl<'g, T> Deref for OwnedArc<'g, T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        unsafe { self.as_ref() }
+    }
+}
+
+impl<'g, T> std::cmp::Eq for OwnedArc<'g, T> {}
+
+impl<'g, T> std::cmp::PartialEq<OwnedArc<'g, T>> for OwnedArc<'g, T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.data == other.data
+    }
+} 
+
+impl<'g, T> ArcLike<T> for OwnedArc<'g, T> {
 
     fn as_non_zero_usize(&self) -> NonZeroUsize {
         self.data
     }
 
     fn into_non_zero_usize(self) -> NonZeroUsize {
-        let OwnedArc { data: data, .. } = self;
+        let OwnedArc { data, .. } = self;
         data
     }
 
 }
 
-impl<'g, T> IntoUsize<'g, T> for OwnedArc<'g, T> {
+impl<'g, T> OptionArcLike<T> for OwnedArc<'g, T> {
     
     fn as_usize(&self) -> usize {
         self.data.get()
@@ -407,14 +493,14 @@ impl<'g, T> FromNonZeroUsize<'g, T> for OwnedArc<'g, T> {
 }
 
 
-impl<'g, T> IntoUsize<'g, T> for Option<OwnedArc<'g, T>> {
+impl<'g, T> OptionArcLike<T> for Option<OwnedArc<'g, T>> {
 
     fn as_usize(&self) -> usize {
         self.as_ref().map_or(0, |x| { x.data.get() })
     }
 
     fn into_usize(self) -> usize {
-        self.map_or(0, |x| { let OwnedArc { data: data, .. } = x; data.get() })
+        self.map_or(0, |x| { let OwnedArc { data, .. } = x; data.get() })
     }
 
 }
@@ -516,7 +602,7 @@ pub struct CompareAndSetError<T, U> {
 }
 
 
-struct AtomicArc<T> {
+pub struct AtomicArc<T> {
     data: AtomicNonZeroUsize,
     _marker: PhantomData<Arc<T>>,
 }
@@ -542,7 +628,7 @@ impl<T> AtomicArc<T> {
         unsafe { ProtectedArc::from_non_zero_usize(self.data.load_consume(), guard) }
     }
 
-    pub fn store<'g, P: IntoNonZeroUsize<'g, T>>(&self, new: P, order: Ordering, guard: &'g Guard) {
+    pub fn store<'g, N: ArcLike<T>>(&self, new: N, order: Ordering, guard: &'g Guard) {
         let order = match order {
             Ordering::Release => Ordering::AcqRel,
             order => order
@@ -550,7 +636,7 @@ impl<T> AtomicArc<T> {
         self.swap(new, order, guard);
     }
 
-    pub fn swap<'g, P: IntoNonZeroUsize<'g, T>>(&self, new: P, order: Ordering, guard: &'g Guard) -> OwnedArc<'g, T> {
+    pub fn swap<'g, N: ArcLike<T>>(&self, new: N, order: Ordering, guard: &'g Guard) -> OwnedArc<'g, T> {
         unsafe { OwnedArc::from_non_zero_usize(self.data.swap(new.into_non_zero_usize(), order), guard) }
     }
     
@@ -561,8 +647,8 @@ impl<T> AtomicArc<T> {
         order: O, 
         guard: &'g Guard
     ) -> Result<OwnedArc<'g, T>, CompareAndSetError<ProtectedArc<'g, T>, N>> where
-        C: IntoNonZeroUsize<'g, T>,
-        N: IntoNonZeroUsize<'g, T>,
+        C: ArcLike<T>,
+        N: ArcLike<T>,
         O: CompareAndSetOrdering,
     {
         // Safety:
@@ -594,8 +680,8 @@ impl<T> AtomicArc<T> {
         order: O, 
         guard: &'g Guard
     ) -> Result<OwnedArc<'g, T>, CompareAndSetError<ProtectedArc<'g, T>, N>> where 
-        C: IntoNonZeroUsize<'g, T>,
-        N: IntoNonZeroUsize<'g, T>,
+        C: ArcLike<T>,
+        N: ArcLike<T>,
         O: CompareAndSetOrdering,
     {
         // Safety:
@@ -662,7 +748,7 @@ impl<T> AtomicOptionArc<T> {
         unsafe { Option::from_usize(self.data.load_consume(), guard) }
     }
 
-    pub fn store<'g, N: IntoUsize<'g, T>>(&self, new: N, order: Ordering, guard: &'g Guard) {
+    pub fn store<'g, N: OptionArcLike<T>>(&self, new: N, order: Ordering, guard: &'g Guard) {
         let order = match order {
             Ordering::Release => Ordering::AcqRel,
             order => order
@@ -670,11 +756,11 @@ impl<T> AtomicOptionArc<T> {
         self.swap(new, order, guard);
     }
 
-    pub fn swap<'g, N: IntoUsize<'g, T>>(&self, new: N, order: Ordering, guard: &'g Guard) -> Option<OwnedArc<'g, T>> {
+    pub fn swap<'g, N: OptionArcLike<T>>(&self, new: N, order: Ordering, guard: &'g Guard) -> Option<OwnedArc<'g, T>> {
         unsafe { Option::from_usize(self.data.swap(new.into_usize(), order), guard) }
     }
 
-    pub fn compare_and_set<'g, C: IntoUsize<'g, T>, N: IntoUsize<'g, T>, O: CompareAndSetOrdering>(
+    pub fn compare_and_set<'g, C: OptionArcLike<T>, N: OptionArcLike<T>, O: CompareAndSetOrdering>(
         &self, 
         current: C, 
         new: N, 
@@ -701,7 +787,7 @@ impl<T> AtomicOptionArc<T> {
         }        
     }
 
-    pub fn compare_and_set_weak<'g, C: IntoUsize<'g, T>, N: IntoUsize<'g, T>, O: CompareAndSetOrdering>(
+    pub fn compare_and_set_weak<'g, C: OptionArcLike<T>, N: OptionArcLike<T>, O: CompareAndSetOrdering>(
         &self, 
         current: C, 
         new: N, 
@@ -742,9 +828,9 @@ impl<T> AtomicOptionArc<T> {
 #[cfg(test)]
 mod tests {
 
-    extern crate crossbeam;
+    //extern crate crossbeam;
 
-    use super::{AtomicOptionArc, ProtectedArc, OwnedArc};
+    use super::AtomicOptionArc;
     use std::sync::Arc;
     use crossbeam::epoch;
     use std::sync::atomic::Ordering;
@@ -815,7 +901,7 @@ mod tests {
                     None => return None,
                     Some(p) => {                        
                         match self.head.compare_and_set_weak(current, p.next, (Ordering::Acquire, Ordering::Acquire), &guard) {
-                            Ok(a) => return Some(unsafe {p.as_arc()}),
+                            Ok(_) => return Some(unsafe {p.as_arc()}),
                             Err(e) => {
                                 current = e.current;
                             }

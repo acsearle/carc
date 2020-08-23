@@ -15,31 +15,40 @@ use std::ptr::NonNull;
 
 // v3: track ownership, use AtomicUsize
 
+/// Models a non-null `*const T`
 #[derive(Copy, Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct NonNullConst<T> {
+pub struct NonNullConst<T: ?Sized> {
     data: NonNull<T>,
 }
 
-impl<T> NonNullConst<T> {
+impl<T: ?Sized> NonNullConst<T> {
 
-    fn new(ptr: *const T) -> Option<Self> {
-        NonNull::new(ptr as *mut T).map(|x| { Self { data: x } } )
-    }
-
+    /// Creates a new `NonNullConst`.
+    ///
+    /// # Safety
+    /// 
+    /// `ptr` must be non-null.
     unsafe fn new_unchecked(ptr: *const T) -> Self {
         Self { data: NonNull::new_unchecked(ptr as *mut T), }
     }
 
+    /// Creates a `NonNullConst` if `ptr` is non-null.
+    fn new(ptr: *const T) -> Option<Self> {
+        NonNull::new(ptr as *mut T).map(|x| { Self { data: x } } )
+    }
+
+
+    /// Returns the underlying non-null pointer
     fn as_ptr(self) -> *const T {
         NonNull::as_ptr(self.data)
     }
 
+    /// Dereferences the content
     unsafe fn as_ref(&self) -> &T {
         NonNull::as_ref(&self.data)
     }
 
 }
-
 
 
 // OptionArc + Arc -> usize

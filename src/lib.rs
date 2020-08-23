@@ -52,6 +52,37 @@ impl<'g, T> OwnedNonNull<'g, T> for Arc<T> {
 
 }
 
+impl<'g, T> OwnedPointer<'g, T> for Arc<T> {
+
+    fn into_owned_usize(self) -> usize {
+        Arc::into_raw(self) as usize
+    }
+
+    unsafe fn from_owned_usize(data: usize, _: &'g Guard) -> Self {
+        match data {
+            0 => panic!("null"),
+            data => Arc::from_raw(data as *const T),
+        }
+    }
+
+}
+
+impl<'g, T> OwnedPointer<'g, T> for Option<Arc<T>> {
+    
+    fn into_owned_usize(self) -> usize {
+        self.map_or(0, |x| { Arc::into_raw(x) as usize })
+    }
+
+    unsafe fn from_owned_usize(data: usize, _: &'g Guard) -> Self {
+        match data {
+            0 => None,
+            data => Some(Arc::from_raw(data as *const T)),
+        }
+    }
+
+}
+
+
 
 
 
@@ -197,6 +228,48 @@ impl<'g, T> OwnedNonNull<'g, T> for OwnedArc<'g, T> {
 }
 
 
+impl<'g, T> OwnedPointer<'g, T> for Option<OwnedArc<'g, T>> {
+    
+    fn into_owned_usize(self) -> usize {
+        self.map_or(0, |x| { 
+            let data = x.data;
+            mem::forget(x);
+            data.get()
+        })
+    }
+
+    unsafe fn from_owned_usize(data: usize, guard: &'g Guard) -> Self {
+        match data {
+            0 => None,
+            data => Some(OwnedArc {
+                data: NonZeroUsize::new_unchecked(data),
+                guard,
+                _marker: PhantomData,
+            }),
+        }
+    }
+}
+
+impl<'g, T> SharedPointer<'g, T> for Option<SharedArc<'g, T>> {
+    
+    fn as_shared_usize(self) -> usize {
+        self.map_or(0, |x| {
+            x.data.get()
+        })
+    }
+
+    unsafe fn from_shared_usize(data: usize) -> Self {
+        match data {
+            0 => None,
+            data => Some(SharedArc {
+                data: NonZeroUsize::new_unchecked(data),
+                _marker: PhantomData,
+            })
+        }
+    }
+
+}
+
 
 pub struct AtomicNonZeroUsize {
     data: AtomicUsize,
@@ -267,6 +340,12 @@ impl AtomicNonZeroUsize {
 }
 
 
+pub struct CompareAndSetError<T, U> {
+    pub current: T,
+    pub new: U,
+}
+
+
 struct AtomicArc<T> {
     data: AtomicNonZeroUsize,
     _marker: PhantomData<Arc<T>>,
@@ -286,17 +365,11 @@ impl<T> AtomicArc<T> {
     }
 
     pub fn load<'g>(&self, order: Ordering, _: &'g Guard) -> SharedArc<'g, T> {
-        SharedArc { 
-            data: self.data.load(order), 
-            _marker: PhantomData,
-        }
+        unsafe { SharedArc::from_shared_non_zero_usize(self.data.load(order)) }
     }
 
     pub fn load_consume<'g>(&self, _guard: &'g Guard) -> SharedArc<'g, T> {
-        SharedArc { 
-            data: self.data.load_consume(), 
-            _marker: PhantomData,
-        }        
+        unsafe { SharedArc::from_shared_non_zero_usize(self.data.load_consume()) }
     }
 
     pub fn store<'g, P: OwnedNonNull<'g, T>>(&self, new: P, order: Ordering, guard: &'g Guard) {
@@ -308,11 +381,7 @@ impl<T> AtomicArc<T> {
     }
 
     pub fn swap<'g, P: OwnedNonNull<'g, T>>(&self, new: P, order: Ordering, guard: &'g Guard) -> OwnedArc<'g, T> {
-        OwnedArc {
-            data: self.data.swap(new.into_owned_non_zero_usize(), order),
-            guard, 
-            _marker: PhantomData,
-        }
+        unsafe { OwnedArc::from_owned_non_zero_usize(self.data.swap(new.into_owned_non_zero_usize(), order), guard) }
     }
     
     pub fn compare_and_set<'g, P: OwnedNonNull<'g, T>, O: CompareAndSetOrdering>(
@@ -321,7 +390,7 @@ impl<T> AtomicArc<T> {
         new: P, 
         order: O,
         guard: &'g Guard
-    ) -> Result<OwnedArc<'g, T>, (SharedArc<'g, T>, P)> {
+    ) -> Result<OwnedArc<'g, T>, CompareAndSetError<SharedArc<'g, T>, P>> {
         // Safety:
         // If the operation fails, the owned new value is reconstructed and returned to the caller
         // If the operation succeeds, the owned old value is returned to the caller
@@ -332,11 +401,16 @@ impl<T> AtomicArc<T> {
             order.success(),
             order.failure()
         ) {
-            Ok(old) => Ok(unsafe { OwnedArc::from_owned_non_zero_usize(old, guard) }),
-            Err(current) => Err((
-                unsafe { SharedArc::from_shared_non_zero_usize(current) },
-                unsafe { P::from_owned_non_zero_usize(new, guard) }
-            )),
+            Ok(old) => Ok(unsafe {
+                mem::forget(new);
+                OwnedArc::from_owned_non_zero_usize(old, guard)
+            }),
+            Err(current) => Err(
+                CompareAndSetError {
+                    current: unsafe { SharedArc::from_shared_non_zero_usize(current) },
+                    new: unsafe { P::from_owned_non_zero_usize(new, guard) }
+                }
+            ),
         }        
     }
 
@@ -346,7 +420,7 @@ impl<T> AtomicArc<T> {
         new: P, 
         order: O,
         guard: &'g Guard
-    ) -> Result<OwnedArc<'g, T>, (SharedArc<'g, T>, P)> {
+    ) -> Result<OwnedArc<'g, T>, CompareAndSetError<SharedArc<'g, T>, P>> {
         // Safety:
         // If the operation fails, the owned new value is reconstructed and returned to the caller
         // If the operation succeeds, the owned old value is returned to the caller
@@ -358,10 +432,12 @@ impl<T> AtomicArc<T> {
             order.failure()
         ) {
             Ok(old) => Ok(unsafe { OwnedArc::from_owned_non_zero_usize(old, guard) }),
-            Err(current) => Err((
-                unsafe { SharedArc::from_shared_non_zero_usize(current) },
-                unsafe { P::from_owned_non_zero_usize(new, guard) }
-            )),
+            Err(current) => Err(
+                CompareAndSetError {
+                    current: unsafe { SharedArc::from_shared_non_zero_usize(current) },
+                    new: unsafe { P::from_owned_non_zero_usize(new, guard) },
+                }
+            ),
         }        
     }
 
@@ -375,239 +451,10 @@ impl<T> AtomicArc<T> {
 
 
 
-/// Roundtrip types that have shared ownership of T
-/// 
-/// Safety: these functions must not be used to launder an OwnedOptionArc into
-/// an Arc<T>, which can result in dropping during the current epoch
-
-impl<'g, T> OwnedPointer<'g, T> for Arc<T> {
-
-    fn into_owned_usize(self) -> usize {
-        Arc::into_raw(self) as usize
-    }
-
-    unsafe fn from_owned_usize(data: usize, _: &'g Guard) -> Self {
-        match data {
-            0 => panic!("null"),
-            data => Arc::from_raw(data as *const T),
-        }
-    }
-
-}
-
-impl<'g, T> OwnedPointer<'g, T> for Option<Arc<T>> {
-    
-    fn into_owned_usize(self) -> usize {
-        self.map_or(0, |x| { Arc::into_raw(x) as usize })
-    }
-
-    unsafe fn from_owned_usize(data: usize, _: &'g Guard) -> Self {
-        match data {
-            0 => None,
-            data => Some(Arc::from_raw(data as *const T)),
-        }
-    }
-
-}
-
-/*
-/// A pointer without shared ownership of T, valid for the current epoch
-/// 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SharedOptionArc<'g, T: 'g> {
-    data: usize,
-    _marker: PhantomData<(&'g(), *const T)>,
-}
-
-impl<'g, T: 'g> SharedOptionArc<'g, T> {
-
-    pub fn null() -> Self {
-        Self {
-            data: 0,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn is_null(&self) -> bool {
-        self.as_raw().is_null()
-    }
-
-    pub fn as_raw(&self) -> *const T {
-        self.data as *const T
-    }
-
-    /// Dereferences the pointer
-    /// 
-    /// Returns a pointer valid during the lifetime `'g`
-    /// 
-    /// # Safety: The pointer may be null, or may be insufficiently synchronized
-    pub unsafe fn deref(&self) -> &'g T {
-        &*self.as_raw()
-    }
-
-    pub unsafe fn as_ref(&self) -> Option<&'g T> {
-        self.as_raw().as_ref()
-    }
-
-    pub unsafe fn as_option_arc(&self) -> Option<Arc<T>> {
-        match self.data {
-            0 => None,
-            data => {
-                let a = Arc::from_raw(data as *const T);
-                mem::forget(a.clone());
-                Some(a)
-            }
-        }
-    }
-
-    pub unsafe fn into_option_arc(self) -> Option<Arc<T>> {
-        self.as_option_arc()
-    }
-
-}
-
-impl<'g, T> Default for SharedOptionArc<'g, T> {
-    fn default() -> Self {
-        Self {
-            data: 0,
-            _marker: PhantomData,
-        }
-    }
-}
 
 
 
-/// A pointer with shared ownership of T, responsible for releasing that
-/// ownership after the current epoch
-#[derive(Debug)]
-pub struct OwnedOptionArc<'g, T> {
-    data: usize,
-    guard: &'g Guard,
-    _marker: PhantomData<T>,
-}
 
-impl<'g, T> OwnedOptionArc<'g, T> {
-
-    pub fn new(value: T, guard: &'g Guard) -> Self {
-        unsafe { Self::from_owned_usize(Arc::new(value).into_owned_usize(), guard) }
-    }
-
-    pub fn null(guard: &'g Guard) -> Self {
-        Self {
-            data: 0,
-            guard: guard,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn is_null(&self) -> bool {
-        self.data == 0
-    }
-
-    pub fn as_shared(&self) -> SharedOptionArc<'g, T> {
-        SharedOptionArc {
-            data: self.data,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn as_option_arc(&self) -> Option<Arc<T>> {
-        match self.data {
-            0 => None,
-            data => {
-                let x = unsafe { Arc::from_raw(data as *const T) };
-                mem::forget(x.clone());
-                Some(x)
-            }
-        }
-    }
-
-    pub fn upgrade(&self) -> Option<Arc<T>> {
-        self.as_option_arc()
-    }
-
-    pub fn into_option_arc(self) -> Option<Arc<T>> {
-        self.as_option_arc() // increments
-        // implicit drop decrements after epoch
-    }
-
-    pub fn into_shared(self) -> SharedOptionArc<'g, T> {
-        self.as_shared()
-        // implicit drop decrements after epoch
-    }
-
-}
-
-impl<'g, T> Clone for OwnedOptionArc<'g, T> {
-    fn clone(&self) -> Self {
-        mem::forget(self.as_option_arc());
-        Self {
-            data: self.data,
-            guard: self.guard,
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<'g, T> Drop for OwnedOptionArc<'g, T> {
-    fn drop(&mut self) {
-        let x = self.data;
-        if x != 0 {
-            unsafe { self.guard.defer_unchecked(move || { 
-                Arc::from_raw(x as *const T)
-            }) };
-        }
-    }
-}
-*/
-
-
-impl<'g, T> OwnedPointer<'g, T> for Option<OwnedArc<'g, T>> {
-    
-    fn into_owned_usize(self) -> usize {
-        self.map_or(0, |x| { 
-            let data = x.data;
-            mem::forget(x);
-            data.get()
-        })
-    }
-
-    unsafe fn from_owned_usize(data: usize, guard: &'g Guard) -> Self {
-        match data {
-            0 => None,
-            data => Some(OwnedArc {
-                data: NonZeroUsize::new_unchecked(data),
-                guard,
-                _marker: PhantomData,
-            }),
-        }
-    }
-}
-
-impl<'g, T> SharedPointer<'g, T> for Option<SharedArc<'g, T>> {
-    
-    fn as_shared_usize(self) -> usize {
-        self.map_or(0, |x| {
-            x.data.get()
-        })
-    }
-
-    unsafe fn from_shared_usize(data: usize) -> Self {
-        match data {
-            0 => None,
-            data => Some(SharedArc {
-                data: NonZeroUsize::new_unchecked(data),
-                _marker: PhantomData,
-            })
-        }
-    }
-
-}
-
-pub struct CompareAndSetError<'g, T: 'g, P: OwnedPointer<'g, T>> {
-    pub current: Option<SharedArc<'g, T>>,
-    pub new: P,
-}
 
 pub struct AtomicOptionArc<T> {
     data: AtomicUsize,
@@ -656,7 +503,7 @@ impl<T> AtomicOptionArc<T> {
         new: P, 
         order: O,
         guard: &'g Guard
-    ) -> Result<Option<OwnedArc<'g, T>>, (Option<SharedArc<'g, T>>, P)> {
+    ) -> Result<Option<OwnedArc<'g, T>>, CompareAndSetError<Option<SharedArc<'g, T>>, P>> {
         // Safety:
         // If the operation fails, the owned new value is reconstructed and returned to the caller
         // If the operation succeeds, the owned old value is returned to the caller
@@ -668,10 +515,12 @@ impl<T> AtomicOptionArc<T> {
             order.failure()
         ) {
             Ok(old) => Ok(unsafe { Option::from_owned_usize(old, guard) }),
-            Err(current) => Err((
-                unsafe { Option::from_shared_usize(current) },
-                unsafe { P::from_owned_usize(new, guard) }
-            )),
+            Err(current) => Err(
+                CompareAndSetError {
+                    current: unsafe { Option::from_shared_usize(current) },
+                    new: unsafe { P::from_owned_usize(new, guard) }
+                }
+            ),
         }        
     }
 
@@ -681,7 +530,7 @@ impl<T> AtomicOptionArc<T> {
         new: P, 
         order: O,
         guard: &'g Guard
-    ) -> Result<Option<OwnedArc<'g, T>>, (Option<SharedArc<'g, T>>, P)> {
+    ) -> Result<Option<OwnedArc<'g, T>>, CompareAndSetError<Option<SharedArc<'g, T>>, P>> {
         // Safety:
         // If the operation fails, the owned new value is reconstructed and returned to the caller
         // If the operation succeeds, the owned old value is returned to the caller
@@ -693,10 +542,12 @@ impl<T> AtomicOptionArc<T> {
             order.failure()
         ) {
             Ok(old) => Ok(unsafe { Option::from_owned_usize(old, guard) }),
-            Err(current) => Err((
-                unsafe { Option::from_shared_usize(current) },
-                unsafe { P::from_owned_usize(new, guard) }
-            )),
+            Err(current) => Err(
+                CompareAndSetError {
+                    current: unsafe { Option::from_shared_usize(current) },
+                    new: unsafe { P::from_owned_usize(new, guard) },
+                }
+            ),
         }        
     }
 

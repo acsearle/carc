@@ -12,24 +12,24 @@ use std::num::NonZeroUsize;
 
 // v3: track ownership, use AtomicUsize
 
-pub trait SharedPointer<'g, T> {
-    fn as_shared_usize(self) -> usize;
-    unsafe fn from_shared_usize(data: usize) -> Self;
+pub trait ProtectedPointer<'g, T> {
+    fn as_protected_usize(self) -> usize;
+    unsafe fn from_protected_usize(data: usize) -> Self;
 }
 
-pub trait OwnedPointer<'g, T> {
-    fn into_owned_usize(self) -> usize;
-    unsafe fn from_owned_usize(data: usize, guard: &'g Guard) -> Self;
+pub trait OwningPointer<'g, T> {
+    fn into_owning_usize(self) -> usize;
+    unsafe fn from_owning_usize(data: usize, guard: &'g Guard) -> Self;
 }
 
-pub trait SharedNonNull<'g, T> {
-    fn as_shared_non_zero_usize(self) -> NonZeroUsize;
-    unsafe fn from_shared_non_zero_usize(data: NonZeroUsize) -> Self;
+pub trait ProtectedNonNull<'g, T> {
+    fn as_protected_non_zero_usize(self) -> NonZeroUsize;
+    unsafe fn from_protected_non_zero_usize(data: NonZeroUsize) -> Self;
 }
 
-pub trait OwnedNonNull<'g, T> {
-    fn into_owned_non_zero_usize(self) -> NonZeroUsize;
-    unsafe fn from_owned_non_zero_usize(data: NonZeroUsize, guard: &'g Guard) -> Self;
+pub trait OwningNonNull<'g, T> {
+    fn into_owning_non_zero_usize(self) -> NonZeroUsize;
+    unsafe fn from_owning_non_zero_usize(data: NonZeroUsize, guard: &'g Guard) -> Self;
 }
 
 // into_owned_non_zero_usize implies into_owned_usize
@@ -40,25 +40,25 @@ pub trait OwnedNonNull<'g, T> {
 
 
 
-impl<'g, T> OwnedNonNull<'g, T> for Arc<T> {
+impl<'g, T> OwningNonNull<'g, T> for Arc<T> {
 
-    fn into_owned_non_zero_usize(self) -> NonZeroUsize {
+    fn into_owning_non_zero_usize(self) -> NonZeroUsize {
         unsafe { NonZeroUsize::new_unchecked(Arc::into_raw(self) as usize)}
     }
 
-    unsafe fn from_owned_non_zero_usize(data: NonZeroUsize, _: &'g Guard) -> Self {
+    unsafe fn from_owning_non_zero_usize(data: NonZeroUsize, _: &'g Guard) -> Self {
         Arc::from_raw(data.get() as *const T)
     }
 
 }
 
-impl<'g, T> OwnedPointer<'g, T> for Arc<T> {
+impl<'g, T> OwningPointer<'g, T> for Arc<T> {
 
-    fn into_owned_usize(self) -> usize {
+    fn into_owning_usize(self) -> usize {
         Arc::into_raw(self) as usize
     }
 
-    unsafe fn from_owned_usize(data: usize, _: &'g Guard) -> Self {
+    unsafe fn from_owning_usize(data: usize, _: &'g Guard) -> Self {
         match data {
             0 => panic!("null"),
             data => Arc::from_raw(data as *const T),
@@ -67,13 +67,13 @@ impl<'g, T> OwnedPointer<'g, T> for Arc<T> {
 
 }
 
-impl<'g, T> OwnedPointer<'g, T> for Option<Arc<T>> {
+impl<'g, T> OwningPointer<'g, T> for Option<Arc<T>> {
     
-    fn into_owned_usize(self) -> usize {
+    fn into_owning_usize(self) -> usize {
         self.map_or(0, |x| { Arc::into_raw(x) as usize })
     }
 
-    unsafe fn from_owned_usize(data: usize, _: &'g Guard) -> Self {
+    unsafe fn from_owning_usize(data: usize, _: &'g Guard) -> Self {
         match data {
             0 => None,
             data => Some(Arc::from_raw(data as *const T)),
@@ -89,12 +89,12 @@ impl<'g, T> OwnedPointer<'g, T> for Option<Arc<T>> {
 
 /// A pointer without shared ownership of T, valid for the current epoch
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SharedArc<'g, T: 'g> {
+pub struct ProtectedArc<'g, T: 'g> {
     data: NonZeroUsize,
     _marker: PhantomData<(&'g(), *const T)>,
 }
 
-impl<'g, T: 'g> SharedArc<'g, T> {
+impl<'g, T: 'g> ProtectedArc<'g, T> {
 
     pub fn as_raw(&self) -> *const T {
         self.data.get() as *const T
@@ -125,13 +125,13 @@ impl<'g, T: 'g> SharedArc<'g, T> {
 
 }
 
-impl<'g, T> SharedNonNull<'g, T> for SharedArc<'g, T> {
+impl<'g, T> ProtectedNonNull<'g, T> for ProtectedArc<'g, T> {
     
-    fn as_shared_non_zero_usize(self) -> NonZeroUsize {
+    fn as_protected_non_zero_usize(self) -> NonZeroUsize {
         self.data
     }
 
-    unsafe fn from_shared_non_zero_usize(data: NonZeroUsize) -> Self {
+    unsafe fn from_protected_non_zero_usize(data: NonZeroUsize) -> Self {
         Self {
             data,
             _marker: PhantomData,
@@ -154,11 +154,11 @@ pub struct OwnedArc<'g, T> {
 impl<'g, T> OwnedArc<'g, T> {
 
     pub fn new(value: T, guard: &'g Guard) -> Self {
-        unsafe { Self::from_owned_non_zero_usize(Arc::new(value).into_owned_non_zero_usize(), guard) }
+        unsafe { Self::from_owning_non_zero_usize(Arc::new(value).into_owning_non_zero_usize(), guard) }
     }
 
-    pub fn as_shared(&self) -> SharedArc<'g, T> {
-        SharedArc {
+    pub fn as_shared(&self) -> ProtectedArc<'g, T> {
+        ProtectedArc {
             data: self.data,
             _marker: PhantomData,
         }
@@ -179,7 +179,7 @@ impl<'g, T> OwnedArc<'g, T> {
         // implicit drop decrements after epoch
     }
 
-    pub fn into_shared(self) -> SharedArc<'g, T> {
+    pub fn into_shared(self) -> ProtectedArc<'g, T> {
         self.as_shared()
         // implicit drop decrements after epoch
     }
@@ -210,15 +210,15 @@ impl<'g, T> Drop for OwnedArc<'g, T> {
     }
 }
 
-impl<'g, T> OwnedNonNull<'g, T> for OwnedArc<'g, T> {
+impl<'g, T> OwningNonNull<'g, T> for OwnedArc<'g, T> {
     
-    fn into_owned_non_zero_usize(self) -> NonZeroUsize {
+    fn into_owning_non_zero_usize(self) -> NonZeroUsize {
         let x = self.data;
         mem::forget(self);
         x
     }
 
-    unsafe fn from_owned_non_zero_usize(data: NonZeroUsize, guard: &'g Guard) -> Self {
+    unsafe fn from_owning_non_zero_usize(data: NonZeroUsize, guard: &'g Guard) -> Self {
         Self {
             data,
             guard,
@@ -228,9 +228,9 @@ impl<'g, T> OwnedNonNull<'g, T> for OwnedArc<'g, T> {
 }
 
 
-impl<'g, T> OwnedPointer<'g, T> for Option<OwnedArc<'g, T>> {
+impl<'g, T> OwningPointer<'g, T> for Option<OwnedArc<'g, T>> {
     
-    fn into_owned_usize(self) -> usize {
+    fn into_owning_usize(self) -> usize {
         self.map_or(0, |x| { 
             let data = x.data;
             mem::forget(x);
@@ -238,7 +238,7 @@ impl<'g, T> OwnedPointer<'g, T> for Option<OwnedArc<'g, T>> {
         })
     }
 
-    unsafe fn from_owned_usize(data: usize, guard: &'g Guard) -> Self {
+    unsafe fn from_owning_usize(data: usize, guard: &'g Guard) -> Self {
         match data {
             0 => None,
             data => Some(OwnedArc {
@@ -250,18 +250,18 @@ impl<'g, T> OwnedPointer<'g, T> for Option<OwnedArc<'g, T>> {
     }
 }
 
-impl<'g, T> SharedPointer<'g, T> for Option<SharedArc<'g, T>> {
+impl<'g, T> ProtectedPointer<'g, T> for Option<ProtectedArc<'g, T>> {
     
-    fn as_shared_usize(self) -> usize {
+    fn as_protected_usize(self) -> usize {
         self.map_or(0, |x| {
             x.data.get()
         })
     }
 
-    unsafe fn from_shared_usize(data: usize) -> Self {
+    unsafe fn from_protected_usize(data: usize) -> Self {
         match data {
             0 => None,
-            data => Some(SharedArc {
+            data => Some(ProtectedArc {
                 data: NonZeroUsize::new_unchecked(data),
                 _marker: PhantomData,
             })
@@ -269,6 +269,7 @@ impl<'g, T> SharedPointer<'g, T> for Option<SharedArc<'g, T>> {
     }
 
 }
+
 
 
 pub struct AtomicNonZeroUsize {
@@ -355,7 +356,7 @@ impl<T> AtomicArc<T> {
 
     pub fn new(value: T) -> Self {
         Self {
-            data: AtomicNonZeroUsize::new(Arc::new(value).into_owned_non_zero_usize()),
+            data: AtomicNonZeroUsize::new(Arc::new(value).into_owning_non_zero_usize()),
             _marker: PhantomData,
         }
     }
@@ -364,15 +365,15 @@ impl<T> AtomicArc<T> {
         unsafe { Arc::from_raw(self.data.into_inner().get() as *const T) }
     }
 
-    pub fn load<'g>(&self, order: Ordering, _: &'g Guard) -> SharedArc<'g, T> {
-        unsafe { SharedArc::from_shared_non_zero_usize(self.data.load(order)) }
+    pub fn load<'g>(&self, order: Ordering, _: &'g Guard) -> ProtectedArc<'g, T> {
+        unsafe { ProtectedArc::from_protected_non_zero_usize(self.data.load(order)) }
     }
 
-    pub fn load_consume<'g>(&self, _guard: &'g Guard) -> SharedArc<'g, T> {
-        unsafe { SharedArc::from_shared_non_zero_usize(self.data.load_consume()) }
+    pub fn load_consume<'g>(&self, _guard: &'g Guard) -> ProtectedArc<'g, T> {
+        unsafe { ProtectedArc::from_protected_non_zero_usize(self.data.load_consume()) }
     }
 
-    pub fn store<'g, P: OwnedNonNull<'g, T>>(&self, new: P, order: Ordering, guard: &'g Guard) {
+    pub fn store<'g, P: OwningNonNull<'g, T>>(&self, new: P, order: Ordering, guard: &'g Guard) {
         let order = match order {
             Ordering::Release => Ordering::AcqRel,
             order => order
@@ -380,62 +381,62 @@ impl<T> AtomicArc<T> {
         self.swap(new, order, guard);
     }
 
-    pub fn swap<'g, P: OwnedNonNull<'g, T>>(&self, new: P, order: Ordering, guard: &'g Guard) -> OwnedArc<'g, T> {
-        unsafe { OwnedArc::from_owned_non_zero_usize(self.data.swap(new.into_owned_non_zero_usize(), order), guard) }
+    pub fn swap<'g, P: OwningNonNull<'g, T>>(&self, new: P, order: Ordering, guard: &'g Guard) -> OwnedArc<'g, T> {
+        unsafe { OwnedArc::from_owning_non_zero_usize(self.data.swap(new.into_owning_non_zero_usize(), order), guard) }
     }
     
-    pub fn compare_and_set<'g, P: OwnedNonNull<'g, T>, O: CompareAndSetOrdering>(
+    pub fn compare_and_set<'g, P: OwningNonNull<'g, T>, O: CompareAndSetOrdering>(
         &self, 
-        current: SharedArc<'g, T>, 
+        current: ProtectedArc<'g, T>, 
         new: P, 
         order: O,
         guard: &'g Guard
-    ) -> Result<OwnedArc<'g, T>, CompareAndSetError<SharedArc<'g, T>, P>> {
+    ) -> Result<OwnedArc<'g, T>, CompareAndSetError<ProtectedArc<'g, T>, P>> {
         // Safety:
         // If the operation fails, the owned new value is reconstructed and returned to the caller
         // If the operation succeeds, the owned old value is returned to the caller
-        let new = new.into_owned_non_zero_usize();
+        let new = new.into_owning_non_zero_usize();
         match self.data.compare_exchange(
-            current.as_shared_non_zero_usize(),
+            current.as_protected_non_zero_usize(),
             new,
             order.success(),
             order.failure()
         ) {
             Ok(old) => Ok(unsafe {
                 mem::forget(new);
-                OwnedArc::from_owned_non_zero_usize(old, guard)
+                OwnedArc::from_owning_non_zero_usize(old, guard)
             }),
             Err(current) => Err(
                 CompareAndSetError {
-                    current: unsafe { SharedArc::from_shared_non_zero_usize(current) },
-                    new: unsafe { P::from_owned_non_zero_usize(new, guard) }
+                    current: unsafe { ProtectedArc::from_protected_non_zero_usize(current) },
+                    new: unsafe { P::from_owning_non_zero_usize(new, guard) }
                 }
             ),
         }        
     }
 
-    pub fn compare_and_set_weak<'g, P: OwnedNonNull<'g, T>, O: CompareAndSetOrdering>(
+    pub fn compare_and_set_weak<'g, P: OwningNonNull<'g, T>, O: CompareAndSetOrdering>(
         &self, 
-        current: SharedArc<'g, T>, 
+        current: ProtectedArc<'g, T>, 
         new: P, 
         order: O,
         guard: &'g Guard
-    ) -> Result<OwnedArc<'g, T>, CompareAndSetError<SharedArc<'g, T>, P>> {
+    ) -> Result<OwnedArc<'g, T>, CompareAndSetError<ProtectedArc<'g, T>, P>> {
         // Safety:
         // If the operation fails, the owned new value is reconstructed and returned to the caller
         // If the operation succeeds, the owned old value is returned to the caller
-        let new = new.into_owned_non_zero_usize();
+        let new = new.into_owning_non_zero_usize();
         match self.data.compare_exchange_weak(
-            current.as_shared_non_zero_usize(),
+            current.as_protected_non_zero_usize(),
             new,
             order.success(),
             order.failure()
         ) {
-            Ok(old) => Ok(unsafe { OwnedArc::from_owned_non_zero_usize(old, guard) }),
+            Ok(old) => Ok(unsafe { OwnedArc::from_owning_non_zero_usize(old, guard) }),
             Err(current) => Err(
                 CompareAndSetError {
-                    current: unsafe { SharedArc::from_shared_non_zero_usize(current) },
-                    new: unsafe { P::from_owned_non_zero_usize(new, guard) },
+                    current: unsafe { ProtectedArc::from_protected_non_zero_usize(current) },
+                    new: unsafe { P::from_owning_non_zero_usize(new, guard) },
                 }
             ),
         }        
@@ -472,20 +473,20 @@ impl<T> AtomicOptionArc<T> {
 
     pub fn new(value: T) -> Self {
         Self {
-            data: AtomicUsize::new(Arc::new(value).into_owned_usize()),
+            data: AtomicUsize::new(Arc::new(value).into_owning_usize()),
             _marker: PhantomData,
         }
     }
 
-    pub fn load<'g>(&self, order: Ordering, _: &'g Guard) -> Option<SharedArc<'g, T>> {
-        unsafe { Option::from_shared_usize(self.data.load(order)) }
+    pub fn load<'g>(&self, order: Ordering, _: &'g Guard) -> Option<ProtectedArc<'g, T>> {
+        unsafe { Option::from_protected_usize(self.data.load(order)) }
     }
 
-    pub fn load_consume<'g>(&self, _guard: &'g Guard) -> Option<SharedArc<'g, T>> {
-        unsafe { Option::from_shared_usize(self.data.load_consume()) }
+    pub fn load_consume<'g>(&self, _guard: &'g Guard) -> Option<ProtectedArc<'g, T>> {
+        unsafe { Option::from_protected_usize(self.data.load_consume()) }
     }
 
-    pub fn store<'g, P: OwnedPointer<'g, T>>(&self, new: P, order: Ordering, guard: &'g Guard) {
+    pub fn store<'g, P: OwningPointer<'g, T>>(&self, new: P, order: Ordering, guard: &'g Guard) {
         let order = match order {
             Ordering::Release => Ordering::AcqRel,
             order => order
@@ -493,59 +494,59 @@ impl<T> AtomicOptionArc<T> {
         self.swap(new, order, guard);
     }
 
-    pub fn swap<'g, P: OwnedPointer<'g, T>>(&self, new: P, order: Ordering, guard: &'g Guard) -> Option<OwnedArc<'g, T>> {
-        unsafe { Option::from_owned_usize(self.data.swap(new.into_owned_usize(), order), guard) }
+    pub fn swap<'g, P: OwningPointer<'g, T>>(&self, new: P, order: Ordering, guard: &'g Guard) -> Option<OwnedArc<'g, T>> {
+        unsafe { Option::from_owning_usize(self.data.swap(new.into_owning_usize(), order), guard) }
     }
 
-    pub fn compare_and_set<'g, P: OwnedPointer<'g, T>, O: CompareAndSetOrdering>(
+    pub fn compare_and_set<'g, P: OwningPointer<'g, T>, O: CompareAndSetOrdering>(
         &self, 
-        current: Option<SharedArc<'g, T>>, 
+        current: Option<ProtectedArc<'g, T>>, 
         new: P, 
         order: O,
         guard: &'g Guard
-    ) -> Result<Option<OwnedArc<'g, T>>, CompareAndSetError<Option<SharedArc<'g, T>>, P>> {
+    ) -> Result<Option<OwnedArc<'g, T>>, CompareAndSetError<Option<ProtectedArc<'g, T>>, P>> {
         // Safety:
         // If the operation fails, the owned new value is reconstructed and returned to the caller
         // If the operation succeeds, the owned old value is returned to the caller
-        let new = new.into_owned_usize();
+        let new = new.into_owning_usize();
         match self.data.compare_exchange(
-            current.as_shared_usize(),
+            current.as_protected_usize(),
             new,
             order.success(),
             order.failure()
         ) {
-            Ok(old) => Ok(unsafe { Option::from_owned_usize(old, guard) }),
+            Ok(old) => Ok(unsafe { Option::from_owning_usize(old, guard) }),
             Err(current) => Err(
                 CompareAndSetError {
-                    current: unsafe { Option::from_shared_usize(current) },
-                    new: unsafe { P::from_owned_usize(new, guard) }
+                    current: unsafe { Option::from_protected_usize(current) },
+                    new: unsafe { P::from_owning_usize(new, guard) }
                 }
             ),
         }        
     }
 
-    pub fn compare_and_set_weak<'g, P: OwnedPointer<'g, T>, O: CompareAndSetOrdering>(
+    pub fn compare_and_set_weak<'g, P: OwningPointer<'g, T>, O: CompareAndSetOrdering>(
         &self, 
-        current: Option<SharedArc<'g, T>>, 
+        current: Option<ProtectedArc<'g, T>>, 
         new: P, 
         order: O,
         guard: &'g Guard
-    ) -> Result<Option<OwnedArc<'g, T>>, CompareAndSetError<Option<SharedArc<'g, T>>, P>> {
+    ) -> Result<Option<OwnedArc<'g, T>>, CompareAndSetError<Option<ProtectedArc<'g, T>>, P>> {
         // Safety:
         // If the operation fails, the owned new value is reconstructed and returned to the caller
         // If the operation succeeds, the owned old value is returned to the caller
-        let new = new.into_owned_usize();
+        let new = new.into_owning_usize();
         match self.data.compare_exchange_weak(
-            current.as_shared_usize(),
+            current.as_protected_usize(),
             new,
             order.success(),
             order.failure()
         ) {
-            Ok(old) => Ok(unsafe { Option::from_owned_usize(old, guard) }),
+            Ok(old) => Ok(unsafe { Option::from_owning_usize(old, guard) }),
             Err(current) => Err(
                 CompareAndSetError {
-                    current: unsafe { Option::from_shared_usize(current) },
-                    new: unsafe { P::from_owned_usize(new, guard) },
+                    current: unsafe { Option::from_protected_usize(current) },
+                    new: unsafe { P::from_owning_usize(new, guard) },
                 }
             ),
         }        

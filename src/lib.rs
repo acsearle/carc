@@ -12,13 +12,33 @@ use std::num::NonZeroUsize;
 
 // v3: track ownership, use AtomicUsize
 
+pub trait SharedPointer<'g, T> {
+    fn as_shared_usize(self) -> usize;
+    unsafe fn from_shared_usize(data: usize) -> Self;
+}
 
+pub trait OwnedPointer<'g, T> {
+    fn into_owned_usize(self) -> usize;
+    unsafe fn from_owned_usize(data: usize, guard: &'g Guard) -> Self;
+}
 
+pub trait SharedNonNull<'g, T> {
+    fn as_shared_non_zero_usize(self) -> NonZeroUsize;
+    unsafe fn from_shared_non_zero_usize(data: NonZeroUsize) -> Self;
+}
 
 pub trait OwnedNonNull<'g, T> {
     fn into_owned_non_zero_usize(self) -> NonZeroUsize;
     unsafe fn from_owned_non_zero_usize(data: NonZeroUsize, guard: &'g Guard) -> Self;
 }
+
+// into_owned_non_zero_usize implies into_owned_usize
+// from_owned_usize implies from_owned_non_zero_usize
+
+
+
+
+
 
 impl<'g, T> OwnedNonNull<'g, T> for Arc<T> {
 
@@ -31,8 +51,6 @@ impl<'g, T> OwnedNonNull<'g, T> for Arc<T> {
     }
 
 }
-
-
 
 
 
@@ -73,15 +91,6 @@ impl<'g, T: 'g> SharedArc<'g, T> {
     pub unsafe fn into_arc(self) -> Arc<T> {
         self.as_arc()
     }
-
-}
-
-
-pub trait SharedNonNull<'g, T> {
-    
-    fn as_shared_non_zero_usize(self) -> NonZeroUsize;
-
-    unsafe fn from_shared_non_zero_usize(data: NonZeroUsize) -> Self;
 
 }
 
@@ -370,10 +379,6 @@ impl<T> AtomicArc<T> {
 /// 
 /// Safety: these functions must not be used to launder an OwnedOptionArc into
 /// an Arc<T>, which can result in dropping during the current epoch
-pub trait OwnedPointer<'g, T> {
-    fn into_owned_usize(self) -> usize;
-    unsafe fn from_owned_usize(data: usize, guard: &'g Guard) -> Self;
-}
 
 impl<'g, T> OwnedPointer<'g, T> for Arc<T> {
 
@@ -577,15 +582,6 @@ impl<'g, T> OwnedPointer<'g, T> for Option<OwnedArc<'g, T>> {
             }),
         }
     }
-}
-
-
-pub trait SharedPointer<'g, T> {
-    
-    fn as_shared_usize(self) -> usize;
-
-    unsafe fn from_shared_usize(data: usize) -> Self;
-
 }
 
 impl<'g, T> SharedPointer<'g, T> for Option<SharedArc<'g, T>> {

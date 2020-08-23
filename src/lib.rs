@@ -4,6 +4,7 @@ use std::cmp;
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem;
+use std::ops::Deref;
 use std::option::Option;
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use crossbeam::epoch::{Guard, CompareAndSetOrdering};
@@ -13,17 +14,19 @@ use std::num::NonZeroUsize;
 // v3: track ownership, use AtomicUsize
 
 pub trait ProtectedPointer<'g, T> {
-    fn as_protected_usize(self) -> usize;
+    fn as_protected_ptr(&self) -> *const T;
+    fn as_protected_usize(&self) -> usize;
     unsafe fn from_protected_usize(data: usize) -> Self;
 }
 
 pub trait OwningPointer<'g, T> {
     fn into_owning_usize(self) -> usize;
     unsafe fn from_owning_usize(data: usize, guard: &'g Guard) -> Self;
+    unsafe fn from_owning_ptr(ptr: *const T, guard:&'g Guard) -> Self;
 }
 
 pub trait ProtectedNonNull<'g, T> {
-    fn as_protected_non_zero_usize(self) -> NonZeroUsize;
+    fn as_protected_non_zero_usize(&self) -> NonZeroUsize;
     unsafe fn from_protected_non_zero_usize(data: NonZeroUsize) -> Self;
 }
 
@@ -36,6 +39,21 @@ pub trait OwningNonNull<'g, T> {
 // from_owned_usize implies from_owned_non_zero_usize
 
 
+impl<'g, T> OwningPointer<'g, T> for *const T {
+    
+    fn into_owning_usize(self) -> usize {
+        self as usize
+    }
+
+    unsafe fn from_owning_usize(data: usize, _guard: &'g Guard) -> Self {
+        data as Self
+    }
+
+    unsafe fn from_owning_ptr(ptr: *const T, _guard: &'g Guard) -> Self {
+        ptr
+    }
+
+}
 
 
 
@@ -58,11 +76,15 @@ impl<'g, T> OwningPointer<'g, T> for Arc<T> {
         Arc::into_raw(self) as usize
     }
 
-    unsafe fn from_owning_usize(data: usize, _: &'g Guard) -> Self {
+    unsafe fn from_owning_usize(data: usize, _guard: &'g Guard) -> Self {
         match data {
             0 => panic!("null"),
             data => Arc::from_raw(data as *const T),
         }
+    }
+
+    unsafe fn from_owning_ptr(ptr: *const T, guard:&'g Guard) -> Self {
+        Self::from_owning_usize(ptr as usize, guard)
     }
 
 }
@@ -80,6 +102,10 @@ impl<'g, T> OwningPointer<'g, T> for Option<Arc<T>> {
         }
     }
 
+    unsafe fn from_owning_ptr(ptr: *const T, guard: &'g Guard) -> Self {
+        Self::from_owning_usize(ptr as usize, guard)
+    }
+
 }
 
 
@@ -88,7 +114,7 @@ impl<'g, T> OwningPointer<'g, T> for Option<Arc<T>> {
 
 
 /// A pointer without shared ownership of T, valid for the current epoch
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct ProtectedArc<'g, T: 'g> {
     data: NonZeroUsize,
     _marker: PhantomData<(&'g(), *const T)>,
@@ -96,21 +122,8 @@ pub struct ProtectedArc<'g, T: 'g> {
 
 impl<'g, T: 'g> ProtectedArc<'g, T> {
 
-    pub fn as_raw(&self) -> *const T {
+    pub fn as_ptr(&self) -> *const T {
         self.data.get() as *const T
-    }
-
-    /// Dereferences the pointer
-    /// 
-    /// Returns a pointer valid during the lifetime `'g`
-    /// 
-    /// # Safety: The pointer may be null, or may be insufficiently synchronized
-    pub unsafe fn deref(&self) -> &'g T {
-        &*self.as_raw()
-    }
-
-    pub unsafe fn as_ref(&self) -> &'g T {
-        &*self.as_raw()
     }
 
     pub unsafe fn as_arc(&self) -> Arc<T> {
@@ -123,11 +136,36 @@ impl<'g, T: 'g> ProtectedArc<'g, T> {
         self.as_arc()
     }
 
+    pub fn ptr_eq<'h>(&self, other: ProtectedArc<'h, T>) -> bool {
+        self.data == other.data
+    }
+
+}
+
+impl<'g, T> Clone for ProtectedArc<'g, T> {
+    fn clone(&self) -> Self {
+        Self {
+            data: self.data,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<'g, T> Copy for ProtectedArc<'g, T> {}
+
+impl<'g, T> Deref for ProtectedArc<'g, T> {
+    
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        unsafe { &*(self.data.get() as *const T) }
+    }
+
 }
 
 impl<'g, T> ProtectedNonNull<'g, T> for ProtectedArc<'g, T> {
     
-    fn as_protected_non_zero_usize(self) -> NonZeroUsize {
+    fn as_protected_non_zero_usize(&self) -> NonZeroUsize {
         self.data
     }
 
@@ -139,6 +177,35 @@ impl<'g, T> ProtectedNonNull<'g, T> for ProtectedArc<'g, T> {
     }
 
 }
+
+impl<'g, T> ProtectedPointer<'g, T> for Option<ProtectedArc<'g, T>> {
+    
+    fn as_protected_ptr(&self) -> *const T {
+        match self.as_ref() {
+            None => std::ptr::null(),
+            Some(x) => x.as_ptr(),
+        }
+    }
+
+    fn as_protected_usize(&self) -> usize {
+        match self.as_ref() {
+            None => 0,
+            Some(x) => x.as_protected_non_zero_usize().get()
+        }
+    }
+
+    unsafe fn from_protected_usize(data: usize) -> Self {
+        match data {
+            0 => None,
+            data => Some(ProtectedArc {
+                data: NonZeroUsize::new_unchecked(data),
+                _marker: PhantomData,
+            })
+        }
+    }
+
+}
+
 
 
 
@@ -248,27 +315,12 @@ impl<'g, T> OwningPointer<'g, T> for Option<OwnedArc<'g, T>> {
             }),
         }
     }
+
+    unsafe fn from_owning_ptr(ptr: *const T, guard: &'g Guard) -> Self {
+        Self::from_owning_usize(ptr as usize, guard)
+    }
 }
 
-impl<'g, T> ProtectedPointer<'g, T> for Option<ProtectedArc<'g, T>> {
-    
-    fn as_protected_usize(self) -> usize {
-        self.map_or(0, |x| {
-            x.data.get()
-        })
-    }
-
-    unsafe fn from_protected_usize(data: usize) -> Self {
-        match data {
-            0 => None,
-            data => Some(ProtectedArc {
-                data: NonZeroUsize::new_unchecked(data),
-                _marker: PhantomData,
-            })
-        }
-    }
-
-}
 
 
 
@@ -563,396 +615,18 @@ impl<T> AtomicOptionArc<T> {
 }
 
 
-
-
-
-
-
-
-
-
-/*
-
-v2: track ownership, use std::sync::atomic::AtomicPtr
-
-pub trait OwnedPointer<T> {
-    fn into_owned_ptr(self) -> *const T;
-    unsafe fn from_owned_ptr(ptr: *const T) -> Self;
-}
-
-impl<T> OwnedPointer<T> for Arc<T> {
-    fn into_owned_ptr(self) -> *const T {
-        let ptr = Arc::into_raw(self);
-        mem::forget(self);
-        ptr
-    }
-    unsafe fn from_owned_ptr(ptr: *const T) -> Self {
-        Arc::from_raw(ptr)
-    }
-}
-
-impl<T> OwnedPointer<T> for OwnedArc<T> {
-    fn into_owned_ptr(self) -> *const T {
-        // self.ptr = Arc::into_raw(this: Self)
-        let ptr = self.ptr;
-        mem::forget(self);
-        ptr
-    }
-
-    unsafe fn  from_owned_ptr(ptr: *const T) -> Self {
-        OwnedArc::from_raw(ptr)
-    }
-}
-
-
-pub struct SharedArc<'g, T> {
-    ptr: *const T,
-    _marker: PhantomData<&'g ()>,
-}
-
-impl<'g, T> From<*const T> for SharedArc<'g, T> {
-    fn from(ptr: *const T) -> Self {
-        Self {
-            ptr,
-            _marker: PhantomData,
-        }
-    }
-}
-
-pub struct OwnedArc<T> {
-    ptr: *const T,
-    _marker: PhantomData<T>,
-}
-
-pub struct AtomicArc<T> {
-    ptr: AtomicPtr<T>, // models a *mut T which is a bit of an impedance mismatch
-}
-
-impl<T> AtomicArc<T> {
-
-    pub fn new(p: Arc<T>) -> Self {
-        Self {
-            ptr: AtomicPtr::new(Arc::into_raw(p) as *mut T),
-        }
-    }
-
-    // get_mut can't be implemented as Arc's binary representation is Nonnull<ArcInner<T>>, of which the T is a field
-
-    pub fn into_inner(self) -> Arc<T> {
-        Arc::from_raw(self.ptr.into_inner())
-    }
-    
-    fn load<'g>(&self, order: Ordering, _guard: &'g epoch::Guard) -> SharedArc<'g, T> {
-        SharedArc::from(self.ptr.load(order) as *const T)
-    }
-
-    fn swap<P: OwnedPointer<T>>(&self, new: P, order: Ordering) -> OwnedArc<T> {
-        OwnedArc::from_owned_ptr(self.ptr.swap(new.into_owned_ptr() as *mut T, order))
-    }
-
-    fn compare_exchange_weak<'g, P: OwnedPointer<T>>(&self, current: SharedArc<T>, new: P, success: Ordering, failure: Ordering, guard: &'g epoch::Guard) -> Result<OwnedArc<T>, (SharedArc<'g, T>, P)> {
-        let new = new.into_owned_ptr();
-        match self.ptr.compare_exchange_weak(current.ptr as *mut T, new as *mut T, success, failure) {
-            Ok(old) => Ok(OwnedArc::from_owned_ptr(old)),
-            Err(current) => Err((SharedArc::from(current as *const T), P::from_owned_ptr(new))),
-        }
-    }
-
-
-}*/
-
-
-
-
-
-
-
-
-
-
-
-
-
-/*
-
-// v1: don't attempt to track ownership, use std::sync::atomic::AtomicPtr
-
-pub trait Pointer<T> {
-    fn into_ptr(self) -> *const T;
-    unsafe fn from_ptr(ptr: *const T) -> Self;
-}
-
-impl<T> Pointer<T> for Arc<T> {
-    fn into_ptr(self) -> *const T {
-        Arc::into_raw(self)
-    }
-    unsafe fn from_ptr(ptr: *const T) -> Self {
-        Arc::from_raw(ptr)
-    }
-}
-
-impl<T> Pointer<T> for Option<Arc<T>> {
-
-    fn into_ptr(self) -> *const T {
-        match self {
-            Some(arc) => Arc::into_raw(arc),
-            None => std::ptr::null(),
-        }
-    }
-
-    unsafe fn from_ptr(ptr: *const T) -> Self {
-        ptr.as_ref().map(|ptr| { Arc::from_raw(ptr) })
-    }
-
-}
-
-// Pointer with manual reference counting
-pub struct Shared<'g, T: 'g> {
-    ptr: *const T,
-    _marker: PhantomData<&'g ()>,
-}
-
-impl <'g, T> Clone for Shared<'g, T> {
-    fn clone(&self) -> Self {
-        Shared { 
-            ptr: self.ptr,
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl <'g, T> Copy for Shared<'g, T> {}
-
-impl <'g, T> Pointer<T> for Shared<'g, T> {
-    
-    fn into_ptr(self) -> *const T {
-        self.ptr
-    }
-
-    unsafe fn from_ptr(ptr: *const T) -> Self {
-        Self { 
-            ptr,
-            _marker: PhantomData,
-        }
-    }
-    
-}
-
-impl<'g, T> Shared<'g, T> {
-
-    /*
-    pub fn from_arc(arc: Option<Arc<T>>) -> Self {
-        Self {
-            ptr: arc.map_or(std::ptr::null(), |arc| { Arc::into_raw(arc) }),
-            _marker: PhantomData,
-        }
-    }
-    */
-
-    pub unsafe fn as_arc(&self) -> Option<Arc<T>> {
-        self.ptr.as_ref().map(|ptr| { Arc::from_raw(ptr) })
-    }
-
-    pub unsafe fn into_arc(self) -> Option<Arc<T>> {
-        self.as_arc()
-    }
-
-    pub fn as_ptr(&self) -> *const T {
-        self.ptr
-    }
-
-    pub unsafe fn as_ref(&self) -> Option<&T> {        
-        self.ptr.as_ref()
-    }
-
-    pub fn increment(&self) -> &Self {
-        let tmp = unsafe { self.as_arc() };
-        mem::forget(tmp.clone());
-        mem::forget(tmp);
-        self
-    }
-
-    pub unsafe fn deferred_decrement(&self, guard: &'g epoch::Guard) -> &Self {
-        assert!(!self.ptr.is_null());
-        let p : *const T = self.ptr;
-        guard.defer_unchecked(move || { Arc::from_raw(p) });
-        self
-    }
-
-}
-
-impl<'g, T> cmp::PartialEq<Shared<'g, T>> for Shared<'g, T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.ptr == other.ptr
-    }
-}
-
-impl<'g, T> cmp::Eq for Shared<'g, T> {}
-
-impl<'g, T> fmt::Debug for Shared<'g, T> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("Shared").field("ptr", &self.ptr).finish()
-    }
-
-}
-
-impl<'g, T> From<Arc<T>> for Shared<'g, T> {
-    fn from(arc: Arc<T>) -> Self {
-        Self {
-            ptr: Arc::into_raw(arc),
-            _marker: PhantomData,
-        }
-    } 
-}
-
-impl<'g, T> From<Option<Arc<T>>> for Shared<'g, T> {
-    fn from(arc: Option<Arc<T>>) -> Self {
-        Self {
-            ptr: arc.map_or(std::ptr::null(), |arc| { Arc::into_raw(arc) }),
-            _marker: PhantomData,
-        }
-    } 
-}
-
-pub struct Owned<T> {
-    ptr: *const T,
-    _marker: PhantomData<T>,
-}
-
-impl<T> Clone for Owned<T> {
-    fn clone(&self) -> Self {
-
-    }
-}
-
-
-
-
-/// An atomic `Option<Arc<T>>` that can be safely shared between threads
-pub struct Atomic<T> {
-    ptr: AtomicPtr<T>,
-    _marker: PhantomData<Arc<T>>,
-}
-
-impl<T: Send + Sync> Atomic<T> {
-
-    // Creates a new atomic option arc
-    pub fn new<P: Pointer<T>>(value: P) -> Self {
-        Atomic {
-            ptr: AtomicPtr::new(value.into_ptr() as *mut T),
-            _marker: PhantomData,
-        }
-    }
-
-    /// Loads a `Shared` from the atomic pointer
-    ///
-    /// # Examples
-    /// 
-    /// ```
-    /// use std::sync::Arc;
-    /// use std::sync::atomic::Ordering;
-    /// use crossbeam::epoch;
-    ///
-    /// let atomic = carc::Atomic::new(Arc::new(1234));
-    /// let guard = epoch::pin();
-    /// let shared = atomic.load(Ordering::Acquire, &guard);
-    /// unsafe { 
-    ///     assert_eq!(shared.as_ref().unwrap(), &1234);
-    /// }
-    /// ```
-    pub fn load<'g>(&self, ord: Ordering, _: &'g epoch::Guard) -> Shared<'g, T> {
-        unsafe { Shared::from_ptr(self.ptr.load(ord)) }
-    }
-
-    /// Swaps the atomic pointer
-    /// 
-    /// # Examples
-    /// 
-    /// ```
-    /// use std::sync::Arc;
-    /// use std::sync::atomic::Ordering;
-    /// use crossbeam::epoch;
-    /// 
-    /// let atomic = carc::Atomic::new(Arc::new(1234));
-    /// let guard = epoch::pin();
-    /// let old = atomic.swap(Arc::new(5678), Ordering::AcqRel, &guard);
-    /// unsafe { 
-    ///     old.deferred_decrement(&guard); // drop old value eventually
-    ///     assert_eq!(old.as_ref().unwrap(), &1234); // still valid for now
-    /// }
-    /// ```
-    pub fn swap<'g, P: Pointer<T>>(&self, new: P, ord: Ordering, _: &'g epoch::Guard) -> Shared<'g, T> {
-        unsafe { Shared::from_ptr(self.ptr.swap(P::into_ptr(new) as *mut T, ord)) }
-    }
-
-    /// Stores the atomic pointer
-    /// 
-    /// Safety: if the old value represents a `Arc` it will be leaked unless action is taken elsewhere
-    /// 
-    /// # Examples
-    /// 
-    /// ```
-    /// use std::sync::Arc;
-    /// use std::sync::atomic::Ordering;
-    /// use crossbeam::epoch;
-    /// 
-    /// let atomic = carc::Atomic::new(Arc::new(1234));
-    /// let guard = epoch::pin();
-    /// atomic.store(Arc::new(5678), Ordering::Release, &guard); 
-    /// // old value is lost and leaked - prefer swap
-    /// ```
-    pub fn store<'g, P: Pointer<T>>(&self, new: P, ord: Ordering, _: &'g epoch::Guard) {
-        self.ptr.store(P::into_ptr(new) as *mut T, ord);
-    }
-
-    /// Exchanges the atomic pointer
-    ///
-    /// # Examples
-    /// 
-    /// ```
-    /// use std::sync::{Arc, atomic::Ordering};
-    /// use crossbeam::epoch;
-    /// 
-    /// let a = carc::Atomic::new(Arc::new(1234));
-    /// let guard = epoch::pin();
-    /// let old = a.load(Ordering::Acquire, &guard);
-    ///  unsafe {
-    ///     let new = carc::Shared::from(Arc::new(1 + old.as_ref().unwrap()));
-    ///     match a.compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed, &guard) {
-    ///         Ok(old) => old,
-    ///         Err(old) => new
-    ///     }.deferred_decrement(&guard); // clean up what wasn't installed
-    ///     let new = a.load(Ordering::Acquire, &guard).increment().as_arc();
-    ///     assert_eq!(new.unwrap().as_ref(), &1235);
-    /// }
-    /// ```
-    pub fn compare_exchange<'g, P: Pointer<T>, Q: Pointer<T>>(&self, current: P, new: Q, success: Ordering, failure: Ordering, _guard: &'g epoch::Guard) -> Result<Shared<T>, P>{        
-        // Safety: all pointers were previously in an Arc or a Shared
-        unsafe {
-            match self.ptr.compare_exchange(P::into_ptr(current) as *mut T, Q::into_ptr(new) as *mut T, success, failure) {
-                Ok(old) => Ok(Shared::from_ptr(old)),
-                Err(old) => Err(P::from_ptr(old)),
-            }
-        }
-    }
-
-}
-
-
-
-
 #[cfg(test)]
 mod tests {
 
     extern crate crossbeam;
 
-    use super::{Atomic, Pointer, Shared};
+    use super::{AtomicOptionArc, ProtectedArc, OwnedArc, OwningPointer, ProtectedPointer, OwningNonNull, ProtectedNonNull};
     use std::sync::Arc;
     use crossbeam::epoch;
     use std::sync::atomic::Ordering;
 
     struct IntrusiveStackNode<T> {
-        next: *const IntrusiveStackNode<T>, // Or Option<Arc<IntrusiveStackNode>>?        
+        next: *const IntrusiveStackNode<T>,
         value: T,
     }
 
@@ -961,10 +635,7 @@ mod tests {
     
     impl<T: Default> Default for IntrusiveStackNode<T> {
         fn default() -> Self {
-            Self {
-                next: std::ptr::null(),
-                value: T::default(),
-            }
+            Self::new(T::default())
         }
     }
 
@@ -979,66 +650,54 @@ mod tests {
 
 
     struct IntrusiveStack<T> {
-        head: Atomic<IntrusiveStackNode<T>>,
-    }
-
-
-    impl<T: Send + Sync + Clone> IntrusiveStack<T> {
-
-        /*
-        fn top(&self) -> Option<T> {
-            let guard = epoch::pin();
-            let old = self.head.load(Ordering::Acquire, &guard);
-            unsafe { old.as_ref().map(|old| { old.value.clone() }) }
-        }
-        */
-
+        head: AtomicOptionArc<IntrusiveStackNode<T>>,
     }
     
     impl<T: Send + Sync> IntrusiveStack<T> {
 
         fn new() -> Self {
             Self {
-                head: Atomic::new(None),
+                head: AtomicOptionArc::null(),
             }
         }
 
         fn top<'g>(&self, guard: &'g epoch::Guard) -> Option<&'g T> {
             let old = self.head.load(Ordering::Acquire, &guard);
-            let p = old.as_ptr();
-            if p.is_null() {
-                None
-            } else {
-                unsafe { Some(&(*p).value) }
-            }
+            old.map(|p| { unsafe { &(*p.as_ptr()).value } })
         }
         fn push(&self, new: Arc<IntrusiveStackNode<T>>) {
-            let new = Shared::from(new);
             let guard = epoch::pin();
-            let mut old = self.head.load(Ordering::Relaxed, &guard);
+            let mut new = new;
+            let mut current = self.head.load(Ordering::Relaxed, &guard);
             loop {
-                unsafe { (*(new.as_ptr() as *mut IntrusiveStackNode<T>)).next = old.as_ptr() };
-                match self.head.compare_exchange(old, new, Ordering::Release, Ordering::Relaxed, &guard) {
+                // wart: ownership transferred only if we win, so is the distinction meaningful?
+                Arc::get_mut(&mut new).unwrap().next = current.as_protected_ptr();
+                match self.head.compare_and_set_weak(current, new, (Ordering::Release, Ordering::Relaxed), &guard) {
                     Ok(_) => break,
-                    Err(b) => { old = b; continue },
+                    Err(b) => { 
+                        current = b.current; 
+                        new = b.new;
+                        continue 
+                    },
                 }
             }
         }
 
         fn pop(&self) -> Option<Arc<IntrusiveStackNode<T>>> {
             let guard = epoch::pin();
-            let mut old = self.head.load(Ordering::Acquire, &guard);
+            let mut current = self.head.load(Ordering::Acquire, &guard);
             loop {
-                if old.as_ptr().is_null() {
-                    return None;
-                }
-                let new = unsafe { Shared::from_ptr((*old.as_ptr()).next) };
-                match self.head.compare_exchange(old, new, Ordering::Acquire, Ordering::Acquire, &guard) {
-                    // we have to increment because the caller can drop the returned arc before the epoch is over
-                    // we have to decrement after the epoch because that count is keeping the node alive for other threads trying to pop
-                    Ok(a) => return unsafe { a.deferred_decrement(&guard).increment().into_arc() },
-                    Err(e) => old = e,
-                }
+                match current {
+                    None => return None,
+                    Some(p) => {                        
+                        match self.head.compare_and_set_weak(current, p.next, (Ordering::Acquire, Ordering::Acquire), &guard) {
+                            Ok(a) => return Some(unsafe {p.as_arc()}),
+                            Err(e) => {
+                                current = e.current;
+                            }
+                        }
+                    }
+                }                
             }
         }
 
@@ -1060,4 +719,3 @@ mod tests {
 
     }
 }
-*/

@@ -41,6 +41,16 @@ impl<T> NonNullConst<T> {
 }
 
 
+
+// OptionArc + Arc -> usize
+// Arc -> NonZeroUsize
+// usize -> Option
+// NonZeroUsize -> OptionArc + Arc
+//
+// OptionArcIn
+// OptionArcOut
+
+
 pub trait ArcLike<'g, T> {
     fn as_non_null(&self) -> NonNullConst<T>;
     fn as_non_zero_usize(&self) -> NonZeroUsize;
@@ -116,6 +126,35 @@ impl<'g, T> ArcLike<'g, T> for Arc<T> {
 
     unsafe fn from_non_zero_usize(data: NonZeroUsize, _guard: &'g Guard) -> Self {
         Arc::from_raw(data.get() as *const T)
+    }
+
+}
+
+impl<'g, T> OptionArcLike<'g, T> for Arc<T> {
+    
+    fn as_ptr(&self) -> *const T {
+        Arc::as_ptr(&self)
+    }
+    
+    fn as_usize(&self) -> usize {
+        self.as_ptr() as usize
+    }
+
+    fn into_ptr(self) -> *const T {
+        Arc::into_raw(self)
+    }
+
+    fn into_usize(self) -> usize {
+        self.into_ptr() as usize
+    }
+
+    unsafe fn from_ptr(ptr: *const T, guard: &'g Guard) -> Self {
+        assert!(!ptr.is_null());
+        Arc::from_raw(ptr)
+    }
+
+    unsafe fn from_usize(data: usize, guard: &'g Guard) -> Self {
+        Self::from_ptr(data as *const T, guard)
     }
 
 }

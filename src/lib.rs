@@ -775,6 +775,14 @@ impl<T> From<UniqueArc<T>> for DeferredArc<T> {
     }
 }
 
+impl<'g, T> From<GuardedArc<'g, T>> for DeferredArc<T> {
+    fn from(x: GuardedArc<T>) -> Self {
+        unsafe {
+            GuardedArc::incr_strong_count(GuardedArc::as_ptr(&x));
+            Self::from_raw(GuardedArc::into_raw(x)) 
+        }
+    }
+}
 
 
 impl<T> std::cmp::PartialEq<DeferredArc<T>> for DeferredArc<T> {
@@ -814,6 +822,85 @@ impl<'g, T> ArcLike<T> for DeferredArc<T> {
 unsafe impl<T> Owning for DeferredArc<T> {}
 unsafe impl<T> NotNull for DeferredArc<T> {}
 
+
+
+pub trait Deferred {}
+impl<T> Deferred for DeferredArc<T> {}
+impl<T: Deferred> Deferred for Option<T> {}
+impl<T: Deferred> Deferred for (T, usize) {}
+
+
+pub struct Loan<'g, T> {
+    data: usize,
+    _marker: PhantomData<&'g T>
+}
+
+impl<'g, T> Loan<'g, T> {
+
+    // In release mode this class could do nothing, depends if we find good
+    // reasons to take the slow paths
+    
+    pub fn new() -> Self {
+        Self {
+            data: 0,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn refinance
+        <Current: ArcLike<T> + Deferred, New: ArcLike<T> + NotOwning>
+        (&mut self, current: &mut Current, new: New, guard: &'g Guard) 
+        -> ()
+    {
+        let new = New::into_usize(new);
+        let mut tmp = unsafe { Current::from_usize(new) };
+        std::mem::swap(current, &mut tmp);
+        let new = new & ptr_mask::<T>();
+        let old = Current::into_usize(tmp) & ptr_mask::<T>();
+        if (self.data != 0) && ((self.data ^ old) != 0) {
+            // wrong pointer!
+            let ptr = self.data as *const T;
+            unsafe {
+                DeferredArc::incr_strong_count(ptr);
+                guard.defer_unchecked(move || { 
+                    DeferredArc::decr_strong_count(ptr)
+                });
+            }
+        }
+        self.data = new;
+    }
+
+    pub fn repay<New: ArcLike<T> + Deferred>
+        (&mut self, new: New, guard: &'g Guard) 
+    {
+        let new = New::into_usize(new) & ptr_mask::<T>();
+        if new != 0 {
+            if new == self.data {
+                // dropping the deferred arc repays the original loan
+                // (possibly through a chain of swaps)
+                self.data = 0;
+            } else {
+                let ptr = self.data as *const T;
+                unsafe {
+                    guard.defer_unchecked(move || {
+                        DeferredArc::decr_strong_count(ptr)
+                    });
+                }
+            }
+        }
+    }
+
+}
+
+impl<'g, T> Drop for Loan<'g, T> {
+    fn drop(&mut self) {
+        let Loan { data, ..} = *self;
+        match data {
+            0 => (), 
+            data => unsafe { DeferredArc::incr_strong_count((data & ptr_mask::<T>()) as *const T) }
+        }
+    }
+}
 
 
 
@@ -1308,15 +1395,15 @@ mod tests {
     use std::sync::Arc;
     use crossbeam::epoch::{Guard};
     use std::sync::atomic::Ordering;
-    use crate::{ArcInterface, ArcLike, DeferredArc, GuardedArc, UniqueArc};
+    use crate::{ArcInterface, ArcLike, DeferredArc, GuardedArc, UniqueArc, Loan};
     
     struct Node<T> {
-        next: Option<Arc<Node<T>>>,
+        next: Option<DeferredArc<Node<T>>>,
         value: T,
     }
 
     struct Snapshot<T> {
-        head: Option<Arc<Node<T>>>,
+        head: Option<DeferredArc<Node<T>>>,
     }
 
     struct Stack<T> {
@@ -1336,26 +1423,49 @@ mod tests {
         fn snapshot<'g>(&self, guard: &'g Guard) -> Snapshot<T> {
             Snapshot { 
                 head: unsafe { 
-                    self.head.load(Ordering::Acquire, guard).0.map(|x| { Arc::from(x)} ) 
+                    self.head.load(Ordering::Acquire, guard).0.map(|x| { 
+                        DeferredArc::from(x) // <-- eager increment
+                    })
                 }
             }
         }
 
         fn push<'g>(&self, value: T, guard: &'g Guard) {
             let mut new = UniqueArc::new(Node { next: None, value });
-            let mut current = self.head.load(Ordering::Relaxed, guard);
+            let mut current = unsafe { self.head.load(Ordering::Relaxed, guard) };
+            let mut loan = Loan::new();
             loop {
-                new.next = current.0; //<-- we need to speculatively store!
+                loan.refinance(&mut new.next, current.0, guard);
                 match unsafe {
                     self.head.compare_and_set_weak(current, new, Ordering::Release, guard)
                 } {
                     Ok(old) => {
-                        forget(old); // <-- we borrowed against this deferred arc (which we can now `annihilate` with)
+                        loan.repay(old, guard);
                         return
                     },
                     Err(err) => {
                         current = err.current;
                         new = err.new;
+                    }
+                }
+            }
+        }
+
+        fn pop<'g>(&self, value: T, guard: &'g Guard) -> Option<T> {
+            let mut current = unsafe { self.head.load(Ordering::Acquire, guard) };
+            let loan = Loan::new();
+            loop {
+                match current {
+                    (None, _tag) => return None,
+                    (Some(arc), _tag) => unsafe {
+                        match self.head.compare_and_set_weak(current, arc.next, Ordering::AcqRel, guard) {
+                            Ok((arc, _tag)) => {
+                                return arc.map(|x| { Arc::from(x) })
+                            },
+                            Err(err) => { 
+                                current = err.current
+                            },
+                        }
                     }
                 }
             }

@@ -158,6 +158,9 @@
 //     counts and deref often and far from responsible calls.  Make the atomic
 //     operations themselves unsafe since it is the memory ordering they
 //     specify that is the root problem.
+//   * fetch bitwise operations for tags
+//     * example: fetch_or(CANCELLED_BIT)
+//   * make a stack with O(1) atomic snapshot
 
 extern crate crossbeam;
 
@@ -273,6 +276,33 @@ impl<T> ArcLike<T> for Arc<T> {
 
 }
 
+impl<'g, T> From<GuardedArc<'g, T>> for Arc<T> {
+    fn from(value: GuardedArc<'g, T>) -> Self {
+        let ptr = GuardedArc::as_ptr(&value);
+        unsafe {
+            GuardedArc::incr_strong_count(ptr);
+            Self::from_raw(ptr)
+        }
+    }
+}
+
+impl<'g, T> From<DeferredArc<T>> for Arc<T> {
+    fn from(value: DeferredArc<T>) -> Self {
+        let ptr = DeferredArc::as_ptr(&value);
+        unsafe {
+            DeferredArc::incr_strong_count(ptr);
+            Self::from_raw(ptr)
+        }
+    }
+}
+
+impl<'g, T> From<UniqueArc<T>> for Arc<T> {
+    fn from(value: UniqueArc<T>) -> Self {
+        let UniqueArc { data } = value;
+        data
+    }
+}
+
 unsafe impl<T> Owning for Arc<T> {}
 unsafe impl<T> NotNull for Arc<T> {}
 
@@ -308,10 +338,7 @@ impl<T, U: ArcLike<T>> ArcLike<T> for (U, usize) {
 
     fn into_usize(this: Self) -> usize {
         let (arc, tag) = this;
-        debug_assert_eq!(tag & ptr_mask::<T>(), 0);
-        // Safety: if the tag is oversized in an optimized build, it may alter
-        // the pointer bits
-        U::into_usize(arc) | tag
+        U::into_usize(arc) | (tag & tag_mask::<T>())
     }
 
     fn as_ptr(this: &Self) -> *const T {
@@ -366,11 +393,12 @@ unsafe impl<T> NotNull for *const T {}
 /// }
 /// const LOCKED_NO_WAITERS = 0;
 /// const NOT_LOCKED = 1;
-/// let head = AtomicOptionArc::<Node>::from(NOT_LOCKED);
+/// let head = AtomicOptionArc::<Node>::new(NOT_LOCKED);
 /// ```
 impl<T> ArcLike<T> for usize {
 
     fn into_usize(this: Self) -> usize {
+        debug_assert_eq!(this & ptr_mask::<T>(), 0);
         this
     }
 
@@ -379,6 +407,7 @@ impl<T> ArcLike<T> for usize {
     }
 
     unsafe fn from_usize(data: usize) -> Self {
+        debug_assert_eq!(data & ptr_mask::<T>(), 0);
         data
     }
 
@@ -553,15 +582,6 @@ impl<'g, T> Deref for GuardedArc<'g, T> {
 }
 
 impl<'g, T: Eq> Eq for GuardedArc<'g, T> {}
-
-impl<'g, T> From<GuardedArc<'g, T>> for Arc<T> {
-    fn from(ptr: GuardedArc<'g, T>) -> Arc<T> {
-        unsafe {
-            GuardedArc::incr_strong_count(GuardedArc::as_ptr(&ptr));
-            Arc::from_raw(GuardedArc::into_raw(ptr))
-        }
-    }
-}
 
 impl<'g, 'h, T: PartialEq> PartialEq<GuardedArc<'h, T>> for GuardedArc<'g, T> {
     fn eq(&self, other: &GuardedArc<'h, T>) -> bool {
@@ -755,14 +775,6 @@ impl<T> From<UniqueArc<T>> for DeferredArc<T> {
     }
 }
 
-impl<'g, T> From<DeferredArc<T>> for Arc<T> {
-    fn from(ptr: DeferredArc<T>) -> Arc<T> {
-        unsafe {
-            DeferredArc::incr_strong_count(DeferredArc::as_ptr(&ptr));
-            Arc::from_raw(DeferredArc::into_raw(ptr))
-        }
-    }
-}
 
 
 impl<T> std::cmp::PartialEq<DeferredArc<T>> for DeferredArc<T> {
@@ -904,13 +916,6 @@ impl<T: Clone> From<Arc<T>> for UniqueArc<T> {
     }
 }
 
-impl<T> From<UniqueArc<T>> for Arc<T> {
-    fn from(value: UniqueArc<T>) -> Self {
-        let UniqueArc { data } = value;
-        data
-    }
-}
-
 impl<T> ArcInterface<T> for UniqueArc<T> {}
 
 
@@ -952,9 +957,9 @@ pub struct AtomicArc<T> {
 
 impl<T> AtomicArc<T> {
 
-    pub fn new(value: T) -> Self {
+    pub fn new<U: ArcLike<T> + Owning + NotNull>(arc: U) -> Self {
         Self {
-            data: AtomicUsize::new(Arc::into_usize(Arc::new(value))),
+            data: AtomicUsize::new(U::into_usize(arc)),
             _marker: PhantomData,
         }
     }
@@ -964,16 +969,14 @@ impl<T> AtomicArc<T> {
         unsafe { ArcLike::from_usize(self.data.into_inner()) }
     }
 
-    pub unsafe fn load
-        <'g>
+    pub unsafe fn load<'g>
         (&self, order: Ordering, _guard: &'g Guard) 
         -> (GuardedArc<'g, T>, usize) 
     {
         ArcLike::from_usize(self.data.load(order)) 
     }
 
-    pub unsafe fn load_consume
-        <'g>
+    pub unsafe fn load_consume<'g>
         (&self, _guard: &'g Guard) 
         -> (GuardedArc<'g, T>, usize)
     {
@@ -994,7 +997,7 @@ impl<T> AtomicArc<T> {
     }
 
     pub unsafe fn swap
-        <'g, N: ArcLike<T> + Owning + NotNull>
+        <N: ArcLike<T> + Owning + NotNull>
         (&self, new: N, order: Ordering) 
         -> (DeferredArc<T>, usize) 
     {
@@ -1039,6 +1042,33 @@ impl<T> AtomicArc<T> {
         }        
     }
 
+    pub unsafe fn fetch_and<'g>
+        (&self, tag: usize, order: Ordering, _guard: &'g Guard) 
+        -> (GuardedArc<'g, T>, usize) 
+    {
+        ArcLike::from_usize(self.data.fetch_and(tag | !tag_mask::<T>(), order))
+    }
+
+    pub unsafe fn fetch_or<'g>
+        (&self, tag: usize, order: Ordering, _guard: &'g Guard)
+        -> (GuardedArc<'g, T>, usize) 
+    {
+        ArcLike::from_usize(self.data.fetch_or(tag & tag_mask::<T>(), order))
+    }
+
+    pub unsafe fn fetch_xor<'g>
+        (&self, tag: usize, order: Ordering, _guard: &'g Guard) 
+        -> (GuardedArc<'g, T>, usize) 
+    {
+        ArcLike::from_usize(self.data.fetch_xor(tag & tag_mask::<T>(), order))
+    }
+
+}
+
+impl<T: Default> Default for AtomicArc<T> {
+    fn default() -> Self {
+        AtomicArc::new(Arc::default())
+    }
 }
 
 impl<T> From<Arc<T>> for AtomicArc<T> {
@@ -1085,7 +1115,7 @@ impl<T> AtomicOptionArc<T> {
     pub unsafe fn load
         <'g>
         (&self, order: Ordering, _guard: &'g Guard) 
-        -> (Option<GuardedArc<'g, T>>, usize) 
+        -> (Option<GuardedArc<T>>, usize) 
     {
         ArcLike::from_usize(self.data.load(order))
     }
@@ -1093,14 +1123,14 @@ impl<T> AtomicOptionArc<T> {
     pub unsafe fn load_consume
         <'g>
         (&self, _guard: &'g Guard) 
-        -> (Option<GuardedArc<'g, T>>, usize)
+        -> (Option<GuardedArc<T>>, usize)
     {
         ArcLike::from_usize(self.data.load_consume())
     }
 
     pub unsafe fn store
-        <'g, N: ArcLike<T> + Owning>
-        (&self, new: N, order: Ordering, guard: &'g Guard) 
+        <'g, New: ArcLike<T> + Owning>
+        (&self, new: New, order: Ordering, guard: &Guard) 
         -> ()
     {
         // Safety: best guess
@@ -1114,48 +1144,72 @@ impl<T> AtomicOptionArc<T> {
 
     pub unsafe fn 
         swap
-        <N: ArcLike<T> + Owning>(&self, new: N, order: Ordering) 
+        <'g, New: ArcLike<T> + Owning>(&self, new: New, order: Ordering) 
         -> (Option<DeferredArc<T>>, usize) 
     {
-        ArcLike::from_usize(self.data.swap(N::into_usize(new), order))
+        ArcLike::from_usize(self.data.swap(New::into_usize(new), order))
     }
 
     pub unsafe fn compare_and_set
-        <'g, C: ArcLike<T> + NotOwning, N: ArcLike<T> + Owning, O: CompareAndSetOrdering>
-        (&self, current: C, new: N, order: O, _guard: &'g Guard) 
-        -> Result<(Option<DeferredArc<T>>, usize), CompareAndSetError<(Option<GuardedArc<'g, T>>, usize), N>> 
+        <'g, Current: ArcLike<T> + NotOwning, New: ArcLike<T> + Owning, Order: CompareAndSetOrdering>
+        (&self, current: Current, new: New, order: Order, _guard: &'g Guard) 
+        -> Result<(Option<DeferredArc<T>>, usize), CompareAndSetError<(Option<GuardedArc<'g, T>>, usize), New>> 
     {
-        let new = ArcLike::into_usize(new);
+        let new = New::into_usize(new);
         match self.data.compare_exchange
-            (C::into_usize(current), new, order.success(), order.failure()) 
+            (Current::into_usize(current), new, order.success(), order.failure()) 
         {
             Ok(old) => Ok(ArcLike::from_usize(old)),
             Err(current) => Err(
                 CompareAndSetError {
                     current: ArcLike::from_usize(current),
-                    new: N::from_usize(new),
+                    new: New::from_usize(new),
                 }
             ),
         }        
     }
 
     pub unsafe fn compare_and_set_weak
-        <'g, C: ArcLike<T> + NotOwning, N: ArcLike<T> + Owning, O: CompareAndSetOrdering>
-        (&self, current: C, new: N, order: O, _guard: &'g Guard) 
-        -> Result<(Option<DeferredArc<T>>, usize), CompareAndSetError<(Option<GuardedArc<'g, T>>, usize), N>> 
+        <'g, Current: ArcLike<T> + NotOwning, New: ArcLike<T> + Owning, Order: CompareAndSetOrdering>
+        (&self, current: Current, new: New, order: Order, _guard: &'g Guard) 
+        -> Result<(Option<DeferredArc<T>>, usize), CompareAndSetError<(Option<GuardedArc<'g, T>>, usize), New>> 
     {
-        let new = ArcLike::into_usize(new);
+        let new = New::into_usize(new);
         match self.data.compare_exchange_weak
-            (C::into_usize(current), new, order.success(), order.failure()) 
+            (Current::into_usize(current), new, order.success(), order.failure()) 
         {
             Ok(old) => Ok(ArcLike::from_usize(old)),
             Err(current) => Err(
                 CompareAndSetError {
                     current: ArcLike::from_usize(current),
-                    new: N::from_usize(new),
+                    new: New::from_usize(new),
                 }
             ),
         }        
+    }
+
+    pub unsafe fn fetch_and<'g>
+        (&self, tag: usize, order: Ordering, _guard: &'g Guard) 
+        -> (Option<GuardedArc<'g, T>>, usize) 
+    {
+        debug_assert_eq!(tag & ptr_mask::<T>(), 0);
+        ArcLike::from_usize(self.data.fetch_and(tag | ptr_mask::<T>(), order))
+    }
+
+    pub unsafe fn fetch_or<'g>
+        (&self, tag: usize, order: Ordering, _guard: &'g Guard) 
+        -> (Option<GuardedArc<'g, T>>, usize)
+    {
+        debug_assert_eq!(tag & ptr_mask::<T>(), 0);
+        ArcLike::from_usize(self.data.fetch_or(tag, order))
+    }
+
+    pub unsafe fn fetch_xor<'g>
+        (&self, tag: usize, order: Ordering, _guard: &'g Guard)
+        -> (Option<GuardedArc<'g, T>>, usize)
+    {
+        debug_assert_eq!(tag & ptr_mask::<T>(), 0);
+        ArcLike::from_usize(self.data.fetch_xor(tag, order))
     }
 
 }
@@ -1252,10 +1306,67 @@ mod tests {
 
     use super::AtomicOptionArc;
     use std::sync::Arc;
-    use crossbeam::epoch;
+    use crossbeam::epoch::{Guard};
     use std::sync::atomic::Ordering;
     use crate::{ArcInterface, ArcLike, DeferredArc, GuardedArc, UniqueArc};
+    
+    struct Node<T> {
+        next: Option<Arc<Node<T>>>,
+        value: T,
+    }
 
+    struct Snapshot<T> {
+        head: Option<Arc<Node<T>>>,
+    }
+
+    struct Stack<T> {
+        head: AtomicOptionArc<Node<T>>,
+    }
+
+    impl<T> Default for Stack<T> {
+        fn default() -> Self {
+            Self {
+                head: AtomicOptionArc::default(),
+            }
+        }
+    }
+
+    impl<T> Stack<T> {
+
+        fn snapshot<'g>(&self, guard: &'g Guard) -> Snapshot<T> {
+            Snapshot { 
+                head: unsafe { 
+                    self.head.load(Ordering::Acquire, guard).0.map(|x| { Arc::from(x)} ) 
+                }
+            }
+        }
+
+        fn push<'g>(&self, value: T, guard: &'g Guard) {
+            let mut new = UniqueArc::new(Node { next: None, value });
+            let mut current = self.head.load(Ordering::Relaxed, guard);
+            loop {
+                new.next = current.0; //<-- we need to speculatively store!
+                match unsafe {
+                    self.head.compare_and_set_weak(current, new, Ordering::Release, guard)
+                } {
+                    Ok(old) => {
+                        forget(old); // <-- we borrowed against this deferred arc (which we can now `annihilate` with)
+                        return
+                    },
+                    Err(err) => {
+                        current = err.current;
+                        new = err.new;
+                    }
+                }
+            }
+        }
+
+    }
+
+
+
+
+    /*
     struct IntrusiveStackNode<T> {
         next: *const IntrusiveStackNode<T>,
         value: T,
@@ -1363,6 +1474,12 @@ mod tests {
         a.push(Arc::new(IntrusiveStackNode::new(10)));
         drop(&g);
         println!("{:?}", x);
+
+    }
+    */
+
+    #[test]
+    fn it_works() {
 
     }
 }

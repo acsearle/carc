@@ -171,25 +171,151 @@ use std::ops::{Deref, DerefMut};
 use std::option::Option;
 use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use crossbeam::epoch::{CompareAndSetOrdering, Guard, pin};
+use crossbeam::epoch::{CompareAndSetOrdering};
 use crossbeam::atomic::AtomicConsume;
 
-// Menagerie
-//
-// Arc - Indepencne
-// GuardedArc - Cheap load, non-owing
-// DeferredArc - Correctness and persistence
-// UniqueArc - Mutability
-//
-// X
-// 
-// Option <-- Nullable
-//
-//
-// *const T - Owning and NotOwning, nullable
-//
-//
-// Common interface -> as_ptr, into_raw, from_raw
+
+
+unsafe fn incr_strong_count<T>(ptr: *const T) {
+    let x = Arc::from_raw(ptr);
+    let y = x.clone(); // clone causes strong increment
+    forget(y); // don't let drop decrement
+    forget(x); // don't let drop decrement
+}
+
+unsafe fn decr_strong_count<T>(ptr: *const T) {
+    Arc::from_raw(ptr); // implicit drop causes decrement
+}
+
+
+struct Ledger {
+
+    // TODO: Need a fast small map (ptr: usize) -> (n: isize, fn)
+    // maybe static sized array? maybe SmallVec?  maybe SmallFlatMap exists somewhere
+    vec: std::vec::Vec<(usize, isize, fn(usize, isize))>,
+
+    // it is benign to spill to earlier action if benchmarking shows that's faster than wrangling a big map
+
+
+}
+
+impl Ledger {
+
+    fn new() -> Self {
+        Self {
+            vec: std::vec::Vec::default()            
+        }
+    }
+
+    pub fn defer_incr<T>(&mut self, ptr: *const T) {
+        let ptr = ptr as usize;
+        let i = 0;
+        while i != self.vec.len() {
+            if self.vec[i].0 == ptr { // <-- linear find
+                if self.vec[i].1 == -1 {
+                    self.vec.swap_remove(i); // <-- remove if it goes to zero
+                } else {
+                    self.vec[i].1 += 1; // <-- note the increment
+                }
+                return
+            }
+            i += 1;
+        }
+        self.vec.push((ptr, 1, |ptr, n| {
+            debug_assert!(n > 0);
+            let ptr = ptr as *const T; // <-- function pointer recovers type
+            while n > 0 {
+                incr_strong_count(ptr);
+                n -= 1;
+            }
+        }));
+    }
+
+    pub fn defer_decr<T>(&mut self, ptr: *const T) {
+        let ptr = ptr as usize;
+        let i = 0;
+        while i != self.vec.len() {
+            if self.vec[i].0 == ptr { // <-- linear find
+                if self.vec[i].1 == 1 {
+                    self.vec.swap_remove(i); // <-- remove if it would go to zero
+                } else {
+                    self.vec[i].1 -= 1; // <-- perform decrement
+                }
+                return
+            }
+            i += 1;
+        }
+        self.vec.push((ptr, 1, |ptr, n| {
+            debug_assert!(n < 0);
+            let ptr = ptr as *const T; // <-- function pointer recovers type
+            while n < 0 {
+                decr_strong_count(ptr);
+                n += 1;
+            }            
+        }));
+    }
+
+    pub fn perform_increments(&mut self) {
+        let i = 0;
+        while i != self.vec.len() {
+            if self.vec[i].1 > 0 {
+                let (p, n, f) = self.vec.swap_remove(i);
+                f(p, n);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    pub fn perform_decrements(&mut self) {
+        let i = 0;
+        while !self.vec.is_empty() {
+            let (p, n, f) = self.vec.swap_remove(0);
+            debug_assert!(n < 0);    
+            f(p, n);
+        }
+    }
+
+}
+
+struct Guard {
+    guard: crossbeam::epoch::Guard,
+    ledger: Ledger,
+
+}
+
+pub fn pin() -> Guard {
+    Guard { 
+        guard: crossbeam::epoch::pin(),
+        ledger: Ledger::new(),
+    }
+}
+
+impl Guard {
+
+    pub fn repin(&mut self) {
+        self.ledger.perform_increments();
+        self.guard.repin();
+        // ok to hold on to the decrements
+    }
+
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        let Guard {guard, ledger} = self;
+        unsafe {
+            guard.defer_unchecked(move || {
+                ledger.perform_decrements()
+            });
+        }
+    }
+}
+
+
+
+
+
 
 /// Compile-time max
 /// 
